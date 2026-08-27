@@ -1,0 +1,105 @@
+# Default values for glauth.
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/glauth/glauth
+  pullPolicy: IfNotPresent
+  # Defaults to the chart appVersion
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+# GLAuth configuration file content (TOML), rendered into a ConfigMap
+# and mounted at /app/config/config.cfg. Ignored when existingConfigMap
+# or existingSecret is set.
+# Example for the Keycloak backend:
+#   config: |
+#     [ldap]
+#       enabled = true
+#       listen = "0.0.0.0:3893"
+#     [backend]
+#       datastore = "keycloak"
+#       keycloakhostname = "idp.example.com"
+#       keycloakport = 8443
+#       keycloakrealm = "master"
+#       keycloakdomain = "example.com"
+config: |
+  [ldap]
+    enabled = true
+    listen = "0.0.0.0:3893"
+  [backend]
+    datastore = "config"
+    baseDN = "dc=glauth,dc=com"
+  [[users]]
+    name = "serviceuser"
+    uidnumber = 5001
+    primarygroup = 5501
+    passsha256 = "652c7dc687d98c9889304ed2e408c74b611e86a40caa51c4b43f1dd5913c5cd0" # mysecret
+  [[groups]]
+    name = "svcaccts"
+    gidnumber = 5501
+  [api]
+    enabled = true
+    listen = "0.0.0.0:5555"
+
+# Use an externally managed ConfigMap (key: config.cfg) instead of `config`
+existingConfigMap: ""
+# Use an externally managed Secret (key: config.cfg) instead of `config`
+# and `existingConfigMap`; takes precedence over both. Useful when the
+# configuration contains credentials.
+existingSecret: ""
+
+service:
+  type: ClusterIP
+  ports:
+    ldap:
+      port: 3893
+      # nodePort: ""
+    ldaps:
+      enabled: false
+      port: 3894
+    api:
+      enabled: true
+      port: 5555
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    drop: ["ALL"]
+
+resources: {}
+  # limits:
+  #   cpu: 200m
+  #   memory: 128Mi
+  # requests:
+  #   cpu: 50m
+  #   memory: 32Mi
+
+# TCP probes against the LDAP port; override with HTTP probes on the API
+# port if ldap.enabled = false in your config.
+livenessProbe:
+  tcpSocket:
+    port: ldap
+readinessProbe:
+  tcpSocket:
+    port: ldap
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

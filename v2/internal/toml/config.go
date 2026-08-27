@@ -465,11 +465,11 @@ func validateConfig(cfg *config.Config) (*config.Config, error) {
 			cfg.Backends[i].Datastore = "config"
 		case "config":
 		case "ldap":
-		case "owncloud":
+		case "keycloak":
 		case "plugin":
 		case "embed":
 		default:
-			return cfg, fmt.Errorf("invalid backend %s - must be 'config', 'ldap', 'owncloud', 'plugin' or 'embed", cfg.Backends[i].Datastore)
+			return cfg, fmt.Errorf("invalid backend %s - must be 'config', 'ldap', 'owncloud', 'keycloak', 'plugin' or 'embed", cfg.Backends[i].Datastore)
 		}
 	}
 

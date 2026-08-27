@@ -1,0 +1,16 @@
+apiVersion: v2
+name: glauth
+description: GLAuth - a lightweight LDAP server with pluggable backends (config file, LDAP proxy, Keycloak, SQL plugins, ...)
+type: application
+version: 0.1.0
+appVersion: "2.5.2"
+keywords:
+  - ldap
+  - authentication
+  - keycloak
+home: https://glauth.github.io/
+sources:
+  - https://github.com/glauth/glauth
+maintainers:
+  - name: glauth
+    url: https://github.com/glauth/glauth
