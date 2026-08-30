@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,7 +65,12 @@ func TestProperBuild(t *testing.T) {
 }
 
 func TestConfigBackendRejectsPasswordlessUserBinds(t *testing.T) {
-	port := 3893
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
 
 	configPath := filepath.Join(t.TempDir(), "passwordless.cfg")
 	config := fmt.Sprintf(`debug = false
@@ -100,7 +106,7 @@ func TestConfigBackendRejectsPasswordlessUserBinds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	svc := startSvc(t, glauthBinary(), "-c", configPath)
+	svc := startSvc(t, fmt.Sprintf("127.0.0.1:%d", port), glauthBinary(), "-c", configPath)
 	defer stopSvc(svc)
 
 	bindDN := "cn=nopass,dc=glauth,dc=com"
@@ -113,11 +119,7 @@ func TestConfigBackendRejectsPasswordlessUserBinds(t *testing.T) {
 		{name: "empty password", password: "", want: "exit status 53"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := doRun("ldapsearch", "-LLL", "-H", fmt.Sprintf("ldap://127.0.0.1:%d", port), "-D", bindDN, "-w", tc.password, "-x", "-b", "dc=glauth,dc=com", "(cn=nopass)")
-			got := getFirst(out)
-			if err != nil {
-				got = err.Error()
-			}
+			got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", fmt.Sprintf("ldap://127.0.0.1:%d", port), "-D", bindDN, "-w", tc.password, "-x", "-b", "dc=glauth,dc=com", "(cn=nopass)")
 			if got != tc.want {
 				t.Fatalf("bind result = %q, want %q", got, tc.want)
 			}
@@ -168,13 +170,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 			Name: "searching for the 'hackers' user",
 			Check: func(t testing.TB) {
 				want := env.expectedaccount
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should find them in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -186,13 +183,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.SkipNow()
 				}
 				want := env.expectedaccount
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdnnogroup, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdnnogroup, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should find them in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -204,13 +196,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.SkipNow()
 				}
 				want := env.expectedaccount
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", "serviceuser@example.com", "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", "serviceuser@example.com", "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should find them in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -219,13 +206,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 			Name: "querying the root SDE",
 			Check: func(t testing.TB) {
 				want := env.expectedinfo
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-s", "base", "(objectclass=*)")
-				got := getSecond(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetSecond(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-s", "base", "(objectclass=*)")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should get some meta information\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -237,13 +219,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.SkipNow()
 				}
 				want := "exit status 50"
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-x", "-s", "base", "(objectclass=*)")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-x", "-s", "base", "(objectclass=*)")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should get error 50\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -252,13 +229,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 			Name: "enumerating posix groups",
 			Check: func(t testing.TB) {
 				want := env.expectedgroup
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(objectclass=posixgroup)")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(objectclass=posixgroup)")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should get a list starting with the 'superheros' group\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -267,13 +239,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 			Name: "searching for members of the 'superheros' group",
 			Check: func(t testing.TB) {
 				want := env.expectedfirstaccount
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com)")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com)")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should get a list starting with the 'hackers' user\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -282,11 +249,7 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 			Name: "performing a complex search for members of 'superheros' group",
 			Check: func(t testing.TB) {
 				want := env.expectedfirstaccount
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(&(objectClass=*)(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com))")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(&(objectClass=*)(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com))")
 				if got != want {
 					t.Fatalf("should get a list starting with the 'hackers' user\ngot:  %s\nwant: %s", got, want)
 				}
@@ -306,13 +269,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.Fatal("Failed to generate totp code:", err)
 				}
 				want := env.scopedaccount
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.otpdn, "-w", "mysecret"+otpvalue, "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
-				got := getFirst(out)
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.otpdn, "-w", "mysecret"+otpvalue, "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
 				if got != want {
-					if err != nil {
-						got = err.Error()
-					}
-					t.Log(out)
 					t.Fatalf("should find them in in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -324,13 +282,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.SkipNow()
 				}
 				want := "exit status 49"
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.otpdn, "-w", "mysecret", "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.otpdn, "-w", "mysecret", "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should get 'Invalid credentials(49)'\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -342,13 +295,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.SkipNow()
 				}
 				want := "exit status 49"
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.otpdn, "-w", "mysecret123456", "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
-				got := getFirst(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetFirst(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.otpdn, "-w", "mysecret123456", "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("should get 'Invalid credentials(49)'\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -360,13 +308,8 @@ func batteryOfTests(t *testing.T, env *testEnv) {
 					t.SkipNow()
 				}
 				want := "employeetype: Intern"
-				out, err := doRun("ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", env.checkemployeetype, "employeetype")
-				got := getSecond(out)
-				if err != nil {
-					got = err.Error()
-				}
+				got := doRunGetSecond(t, "ldapsearch", "-LLL", "-H", "ldap://127.0.0.1:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", env.checkemployeetype, "employeetype")
 				if got != want {
-					t.Log(out)
 					t.Fatalf("type should be 'Intern'\ngot:  %s\nwant: %s", got, want)
 				}
 			},
@@ -396,7 +339,7 @@ func TestSampleSimple(t *testing.T) {
 		checkemployeetype:     "cn=hackers",
 	}
 
-	svc := startSvc(t, glauthBinary(), "-c", ldapOnlyConfig(t, "sample-simple.cfg"))
+	svc := startSvc(t, "127.0.0.1:3893", glauthBinary(), "-c", ldapOnlyConfig(t, "sample-simple.cfg"))
 	batteryOfTests(t, &env)
 	stopSvc(svc)
 }
@@ -423,7 +366,7 @@ func TestSQLitePlugin(t *testing.T) {
 		checkemployeetype:     "",
 	}
 
-	svc := startSvc(t, glauthBinary(), "-c", "pkg/plugins/glauth-sqlite/sample-database.cfg")
+	svc := startSvc(t, "127.0.0.1:3893", glauthBinary(), "-c", "pkg/plugins/glauth-sqlite/sample-database.cfg")
 	batteryOfTests(t, &env)
 	stopSvc(svc)
 }
@@ -455,13 +398,13 @@ func TestLdapInjection(t *testing.T) {
 		checkemployeetype:     "",
 	}
 
-	svc := startSvc(t, glauthBinary(), "-c", "sample-ldap-injection.cfg")
+	svc := startSvc(t, "127.0.0.1:3893", glauthBinary(), "-c", "sample-ldap-injection.cfg")
 	batteryOfTests(t, &env)
 	stopSvc(svc)
 }
 
 // -----=============================================================================----
-func WaitForPort(host string, timeout time.Duration) error {
+func waitForPort(host string, timeout time.Duration) error {
 	start := time.Now()
 	for {
 		conn, err := ldap.Dial("tcp", host)
@@ -487,14 +430,14 @@ func WaitForPort(host string, timeout time.Duration) error {
 	}
 }
 
-func startSvc(t *testing.T, name string, arg ...string) *exec.Cmd {
-
+func startSvc(t *testing.T, addr string, name string, arg ...string) *exec.Cmd {
 	cmd := exec.Command(name, arg...)
 	cmd.Stderr = t.Output()
 	cmd.Stdout = t.Output()
-	cmd.Start()
-	err := WaitForPort("127.0.0.1:3893", time.Second*2)
-	if err != nil {
+	if err := cmd.Start(); err != nil {
+		t.Fatal("Failed to start glauth:", err)
+	}
+	if err := waitForPort(addr, time.Second*2); err != nil {
 		t.Fatal("Failed to wait for glauth to start:", err)
 	}
 	// the port is listening but the ldap server may not be accepting connections yet
@@ -530,4 +473,24 @@ func doRun(name string, arg ...string) (string, error) {
 	}
 
 	return string(bytes.TrimSpace(out)), nil
+}
+
+func doRunGetFirst(t testing.TB, name string, arg ...string) string {
+	t.Helper()
+	return runAndSelect(t, getFirst, name, arg...)
+}
+
+func doRunGetSecond(t testing.TB, name string, arg ...string) string {
+	t.Helper()
+	return runAndSelect(t, getSecond, name, arg...)
+}
+
+func runAndSelect(t testing.TB, pick func(string) string, name string, arg ...string) string {
+	t.Helper()
+	out, err := doRun(name, arg...)
+	if err != nil {
+		t.Log(out)
+		return err.Error()
+	}
+	return pick(out)
 }
