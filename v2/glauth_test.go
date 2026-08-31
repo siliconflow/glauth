@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,6 +12,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/glauth/ldap"
+	"github.com/pquerna/otp/totp"
 )
 
 type testEnv struct {
@@ -97,11 +102,11 @@ func TestConfigBackendRejectsPasswordlessUserBinds(t *testing.T) {
     action = "search"
     object = "*"
 `, port)
-	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	svc := startSvc(SD, glauthBinary(), "-c", configPath)
+	svc := startSvc(t, fmt.Sprintf("127.0.0.1:%d", port), glauthBinary(), "-c", configPath)
 	defer stopSvc(svc)
 
 	bindDN := "cn=nopass,dc=glauth,dc=com"
@@ -114,7 +119,7 @@ func TestConfigBackendRejectsPasswordlessUserBinds(t *testing.T) {
 		{name: "empty password", password: "", want: "exit status 53"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := doRunGetFirst(0, "ldapsearch", "-LLL", "-H", fmt.Sprintf("ldap://127.0.0.1:%d", port), "-D", bindDN, "-w", tc.password, "-x", "-b", "dc=glauth,dc=com", "(cn=nopass)")
+			got := runAndSelect(t, getFirst, "ldapsearch", "-LLL", "-H", fmt.Sprintf("ldap://127.0.0.1:%d", port), "-D", bindDN, "-w", tc.password, "-x", "-b", "dc=glauth,dc=com", "(cn=nopass)")
 			if got != tc.want {
 				t.Fatalf("bind result = %q, want %q", got, tc.want)
 			}
@@ -149,153 +154,139 @@ func ldapOnlyConfig(t *testing.T, source string) string {
 
 	contents = contents[:start] + sectionWithoutLDAPS + contents[end:]
 	path := filepath.Join(t.TempDir(), filepath.Base(source))
-	if err := os.WriteFile(path, []byte(contents), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	return path
 }
 
 func batteryOfTests(t *testing.T, env *testEnv) {
+	// We aren't checking that "github.com/pquerna/otp/totp" creates correct values.
+	// That's what their own tests are for.
+	// We are checking that the totp code gets through glauth code successfully
+	otpvalue, err := totp.GenerateCode("3hnvnk4ycv44glzigd6s25j4dougs3rk", time.Now())
+	if err != nil {
+		t.Fatal("Failed to generate totp code:", err)
+	}
+
+	const addr = "ldap://127.0.0.1:3893"
+	bind := func(dn, password string, rest ...string) []string {
+		return append([]string{"-LLL", "-H", addr, "-D", dn, "-w", password, "-x"}, rest...)
+	}
+	svc := func(rest ...string) []string { return bind(env.svcdn, "mysecret", rest...) }
+	otp := func(password string) []string {
+		return bind(env.otpdn, password, "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
+	}
+
+	const (
+		inSuperheros = "should find them in the 'superheros' group"
+		listFromUser = "should get a list starting with the 'hackers' user"
+		badCreds     = "should get 'Invalid credentials(49)'"
+	)
+
 	tests := []struct {
-		Name  string
-		Path  string
-		Check func(t testing.TB)
+		name string
+		skip bool
+		args []string
+		line func(string) string
+		want string
+		msg  string
 	}{
 		{
-			Name: "searching for the 'hackers' user",
-			Check: func(t testing.TB) {
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
-				if got, want := out, env.expectedaccount; got != want {
-					t.Fatalf("should find them in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hackers' user",
+			args: svc("-bdc=glauth,dc=com", "cn=hackers"),
+			want: env.expectedaccount,
+			msg:  inSuperheros,
 		},
 		{
-			Name: "searching for the 'hackers' user without binding with a group",
-			Check: func(t testing.TB) {
-				if env.svcdnnogroup == "" {
-					t.SkipNow()
-				}
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdnnogroup, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
-				if got, want := out, env.expectedaccount; got != want {
-					t.Fatalf("should find them in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hackers' user without binding with a group",
+			skip: env.svcdnnogroup == "",
+			args: bind(env.svcdnnogroup, "mysecret", "-bdc=glauth,dc=com", "cn=hackers"),
+			want: env.expectedaccount,
+			msg:  inSuperheros,
 		},
 		{
-			Name: "searching for the 'hackers' user after binding using the account's UPN",
-			Check: func(t testing.TB) {
-				if !env.checkbindUPN {
-					t.SkipNow()
-				}
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", "serviceuser@example.com", "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "cn=hackers")
-				if got, want := out, env.expectedaccount; got != want {
-					t.Fatalf("should find them in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hackers' user after binding using the account's UPN",
+			skip: !env.checkbindUPN,
+			args: bind("serviceuser@example.com", "mysecret", "-bdc=glauth,dc=com", "cn=hackers"),
+			want: env.expectedaccount,
+			msg:  inSuperheros,
 		},
 		{
-			Name: "querying the root SDE",
-			Check: func(t testing.TB) {
-				out := doRunGetSecond(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-s", "base", "(objectclass=*)")
-				if got, want := out, env.expectedinfo; got != want {
-					t.Fatalf("should get some meta information\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "querying the root SDE",
+			args: svc("-s", "base", "(objectclass=*)"),
+			line: getSecond,
+			want: env.expectedinfo,
+			msg:  "should get some meta information",
 		},
 		{
-			Name: "querying the root SDE anonymously without authorizing in config file",
-			Check: func(t testing.TB) {
-				if !env.checkanonymousrootDSE {
-					t.SkipNow()
-				}
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-x", "-s", "base", "(objectclass=*)")
-				if got, want := out, "exit status 50"; got != want {
-					t.Fatalf("should get error 50\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "querying the root SDE anonymously without authorizing in config file",
+			skip: !env.checkanonymousrootDSE,
+			args: []string{"-LLL", "-H", addr, "-x", "-s", "base", "(objectclass=*)"},
+			want: "exit status 50",
+			msg:  "should get error 50",
 		},
 		{
-			Name: "enumerating posix groups",
-			Check: func(t testing.TB) {
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(objectclass=posixgroup)")
-				if got, want := out, env.expectedgroup; got != want {
-					t.Fatalf("should get a list starting with the 'superheros' group\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "enumerating posix groups",
+			args: svc("-bdc=glauth,dc=com", "(objectclass=posixgroup)"),
+			want: env.expectedgroup,
+			msg:  "should get a list starting with the 'superheros' group",
 		},
 		{
-			Name: "searching for members of the 'superheros' group",
-			Check: func(t testing.TB) {
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com)")
-				if got, want := out, env.expectedfirstaccount; got != want {
-					t.Fatalf("should get a list starting with the 'hackers' user\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for members of the 'superheros' group",
+			args: svc("-bdc=glauth,dc=com", "(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com)"),
+			want: env.expectedfirstaccount,
+			msg:  listFromUser,
 		},
 		{
-			Name: "performing a complex search for members of 'superheros' group",
-			Check: func(t testing.TB) {
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", "(&(objectClass=*)(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com))")
-				if got, want := out, env.expectedfirstaccount; got != want {
-					t.Fatalf("should get a list starting with the 'hackers' user\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "performing a complex search for members of 'superheros' group",
+			args: svc("-bdc=glauth,dc=com", "(&(objectClass=*)(memberOf=ou=superheros,ou=groups,dc=glauth,dc=com))"),
+			want: env.expectedfirstaccount,
+			msg:  listFromUser,
 		},
 		{
-			Name: "searching for the 'hacker' user using a TOTP-enabled account",
-			Check: func(t testing.TB) {
-				if !env.checkTOTP {
-					t.SkipNow()
-				}
-				otpvalue := doRunGetFirst(RD, "oathtool", "--totp", "-b", "-d", "6", "3hnvnk4ycv44glzigd6s25j4dougs3rk")
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.otpdn, "-w", "mysecret"+otpvalue, "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
-				if got, want := out, env.scopedaccount; got != want {
-					t.Fatalf("should find them in in the 'superheros' group\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hacker' user using a TOTP-enabled account",
+			skip: !env.checkTOTP,
+			args: otp("mysecret" + otpvalue),
+			want: env.scopedaccount,
+			msg:  inSuperheros,
 		},
 		{
-			Name: "searching for the 'hacker' user using a TOTP-enabled account and no value",
-			Check: func(t testing.TB) {
-				if !env.checkTOTP {
-					t.SkipNow()
-				}
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.otpdn, "-w", "mysecret", "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
-				if got, want := out, "exit status 49"; got != want {
-					t.Fatalf("should get 'Invalid credentials(49)'\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hacker' user using a TOTP-enabled account and no value",
+			skip: !env.checkTOTP,
+			args: otp("mysecret"),
+			want: "exit status 49",
+			msg:  badCreds,
 		},
 		{
-			Name: "searching for the 'hacker' user using a TOTP-enabled account and the wrong value",
-			Check: func(t testing.TB) {
-				if !env.checkTOTP {
-					t.SkipNow()
-				}
-				out := doRunGetFirst(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.otpdn, "-w", "mysecret123456", "-x", "-bou=superheros,dc=glauth,dc=com", "cn=hackers")
-				if got, want := out, "exit status 49"; got != want {
-					t.Fatalf("should get 'Invalid credentials(49)'\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hacker' user using a TOTP-enabled account and the wrong value",
+			skip: !env.checkTOTP,
+			args: otp("mysecret123456"),
+			want: "exit status 49",
+			msg:  badCreds,
 		},
 		{
-			Name: "searching for the 'hacker' user",
-			Check: func(t testing.TB) {
-				if env.checkemployeetype == "" {
-					t.SkipNow()
-				}
-				out := doRunGetSecond(RD, "ldapsearch", "-LLL", "-H", "ldap://localhost:3893", "-D", env.svcdn, "-w", "mysecret", "-x", "-bdc=glauth,dc=com", env.checkemployeetype, "employeetype")
-				if got, want := out, "employeetype: Intern"; got != want {
-					t.Fatalf("type should be 'Intern'\ngot:  %s\nwant: %s", got, want)
-				}
-			},
+			name: "searching for the 'hacker' user",
+			skip: env.checkemployeetype == "",
+			args: svc("-bdc=glauth,dc=com", env.checkemployeetype, "employeetype"),
+			line: getSecond,
+			want: "employeetype: Intern",
+			msg:  "type should be 'Intern'",
 		},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.Name, func(t *testing.T) {
-			tc.Check(t)
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip {
+				t.SkipNow()
+			}
+			line := tc.line
+			if line == nil {
+				line = getFirst
+			}
+			if got := runAndSelect(t, line, "ldapsearch", tc.args...); got != tc.want {
+				t.Fatalf("%s\ngot:  %s\nwant: %s", tc.msg, got, tc.want)
+			}
 		})
 	}
 }
@@ -316,14 +307,15 @@ func TestSampleSimple(t *testing.T) {
 		checkemployeetype:     "cn=hackers",
 	}
 
-	svc := startSvc(SD, glauthBinary(), "-c", ldapOnlyConfig(t, "sample-simple.cfg"))
+	svc := startSvc(t, "127.0.0.1:3893", glauthBinary(), "-c", ldapOnlyConfig(t, "sample-simple.cfg"))
 	batteryOfTests(t, &env)
 	stopSvc(svc)
 }
 
 func TestSQLitePlugin(t *testing.T) {
-	matchingLibrary := doRunGetFirst(RD, "ls", "bin/sqlite.so")
-	if matchingLibrary != "bin/sqlite.so" {
+	_, err := os.Stat("bin/sqlite.so")
+	if err != nil {
+		t.Log("Unable to find sqlite plugin")
 		t.SkipNow()
 	}
 
@@ -342,14 +334,20 @@ func TestSQLitePlugin(t *testing.T) {
 		checkemployeetype:     "",
 	}
 
-	svc := startSvc(SD, glauthBinary(), "-c", "pkg/plugins/glauth-sqlite/sample-database.cfg")
+	svc := startSvc(t, "127.0.0.1:3893", glauthBinary(), "-c", "pkg/plugins/glauth-sqlite/sample-database.cfg")
 	batteryOfTests(t, &env)
 	stopSvc(svc)
 }
 
 func TestLdapInjection(t *testing.T) {
-	matchingContainers := doRunGetFirst(RD, "sh", "-c", "docker ps | grep ldap-service | wc -l")
+	out, err := doRun("sh", "-c", "docker ps | grep ldap-service | wc -l")
+	if err != nil {
+		t.Log("Unable to find docker container:", out)
+		t.SkipNow()
+	}
+	matchingContainers := getFirst(out)
 	if matchingContainers != "1" {
+		t.Log("Unable to find docker container:", out)
 		t.SkipNow()
 	}
 
@@ -368,52 +366,89 @@ func TestLdapInjection(t *testing.T) {
 		checkemployeetype:     "",
 	}
 
-	svc := startSvc(SD, glauthBinary(), "-c", "sample-ldap-injection.cfg")
+	svc := startSvc(t, "127.0.0.1:3893", glauthBinary(), "-c", "sample-ldap-injection.cfg")
 	batteryOfTests(t, &env)
 	stopSvc(svc)
 }
 
 // -----=============================================================================----
-
-const SD = 3 // Start Delay
-const RD = 2 // Response Delay
-
-func startSvc(delay time.Duration, name string, arg ...string) *exec.Cmd {
-	cmd := exec.Command(name, arg...)
-	cmd.Start()
-	if delay != 0 {
-		time.Sleep(time.Second * delay)
+func waitForPort(host string, timeout time.Duration) error {
+	start := time.Now()
+	for {
+		conn, err := ldap.Dial("tcp", host)
+		if err == nil {
+			err = conn.Bind("_", "_")
+			if err == nil {
+				conn.Close()
+				return fmt.Errorf("Successfully authenticated to glauth. This should not happen")
+			}
+			e := &ldap.Error{}
+			if errors.As(err, &e) && e.ResultCode == 49 {
+				conn.Close()
+				return nil
+			}
+			conn.Close()
+			// We have an error, it's probably a connection error or an error saying that ldap isn't setup yet
+			// try again
+		}
+		if time.Since(start) > timeout {
+			return fmt.Errorf("timeout waiting for port %s: %w", host, err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func startSvc(t *testing.T, addr string, name string, arg ...string) *exec.Cmd {
+	cmd := exec.Command(name, arg...)
+	cmd.Stderr = t.Output()
+	cmd.Stdout = t.Output()
+	if err := cmd.Start(); err != nil {
+		t.Fatal("Failed to start glauth:", err)
+	}
+	if err := waitForPort(addr, time.Second*2); err != nil {
+		t.Fatal("Failed to wait for glauth to start:", err)
+	}
+	// the port is listening but the ldap server may not be accepting connections yet
+	// TODO: make glauth listen as the last part of the initialization that way as soon as it listens it can process connections
 	return cmd
 }
 
 func stopSvc(svc *exec.Cmd) {
 	svc.Process.Kill()
+	svc.Process.Wait()
 }
 
-func doRunGetFirst(delay time.Duration, name string, arg ...string) string {
-	out := strings.SplitN(doRun(delay, name, arg...), "\n", 2)
-	if out == nil || len(out) < 1 {
+func getFirst(output string) string {
+	out := strings.SplitN(output, "\n", 2)
+	if len(out) < 1 {
 		return "*fail*"
 	}
 	return out[0]
 }
 
-func doRunGetSecond(delay time.Duration, name string, arg ...string) string {
-	out := strings.SplitN(doRun(delay, name, arg...), "\n", 3)
-	if out == nil || len(out) < 2 {
+func getSecond(output string) string {
+	out := strings.SplitN(output, "\n", 3)
+	if len(out) < 2 {
 		return "*fail*"
 	}
 	return out[1]
 }
 
-func doRun(delay time.Duration, name string, arg ...string) string {
-	out, err := exec.Command(name, arg...).Output()
+func doRun(name string, arg ...string) (string, error) {
+	out, err := exec.Command(name, arg...).CombinedOutput()
 	if err != nil {
+		return string(bytes.TrimSpace(out)), err
+	}
+
+	return string(bytes.TrimSpace(out)), nil
+}
+
+func runAndSelect(t testing.TB, pick func(string) string, name string, arg ...string) string {
+	t.Helper()
+	out, err := doRun(name, arg...)
+	if err != nil {
+		t.Log(out)
 		return err.Error()
 	}
-	if delay != 0 {
-		time.Sleep(time.Second * delay)
-	}
-	return strings.TrimSpace(string(out))
+	return pick(out)
 }
