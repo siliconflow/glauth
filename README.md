@@ -119,6 +119,10 @@ ldapsearch ... -D "cn=<client_id>,cn=bind,dc=example,dc=com" -w "<client_secret>
   -b "cn=users,dc=example,dc=com" "(objectClass=user)"
 ```
 
+Searches accept arbitrary LDAP filters and attribute subsets over the users and groups containers. Simple equality filters on `sAMAccountName`/`cn`/`userPrincipalName`/`mail`/`givenName`/`sn` (groups: `sAMAccountName`/`cn`) are pushed down to Keycloak REST queries; all other filters are evaluated server-side over the full list. Results are limited to Keycloak's default page size (100 entries) when listing everything.
+
+The Keycloak client must be confidential with *Service accounts roles* enabled; give its service account the `realm-management` roles `view-users`, `query-users` and `query-groups`. Add/Modify/Delete are not supported (read-only proxy). A complete example is in [sample-keycloak.cfg](https://github.com/glauth/glauth/blob/master/v2/sample-keycloak.cfg).
+
 ### Docker and Kubernetes:
 
 Build an image directly from source (no pre-built binaries needed):

@@ -128,7 +128,6 @@ var filterGroupsWithPrefix = regexp.MustCompile("^\\(&\\(objectClass=group\\)" +
 	"\\(\\|\\(sAMAccountName=(.+)\\*\\)" +
 	"\\(cn=(.*)\\*\\)\\)\\)$")
 var filterRootDSE = regexp.MustCompile("^\\(objectclass=\\*\\)$")
-var filterUsers = regexp.MustCompile("^\\(objectClass=user\\)$")
 var filterUsersWithPrefix = regexp.MustCompile("^\\(&\\(objectClass=user\\)" +
 	"\\(\\|\\(sAMAccountName=(.+)\\*\\)" +
 	"\\(sn=(.+)\\*\\)" +
@@ -137,24 +136,22 @@ var filterUsersWithPrefix = regexp.MustCompile("^\\(&\\(objectClass=user\\)" +
 	"\\(displayname=(.*)\\*\\)" +
 	"\\(userPrincipalName=(.*)\\*\\)\\)\\)$")
 
-var attributes0 = []string{}
-var attributes3 = []string{
-	"sAMAccountName",
-	"description",
-	"objectSid"}
-var attributes9 = []string{
-	"sAMAccountName",
-	"userPrincipalName",
-	"description",
-	"givenName",
-	"sn",
-	"mail",
-	"userAccountControl",
-	"lockoutTime",
-	"objectSid"}
+// Simple equality filters, optionally wrapped in an objectClass AND.
+var filterUserEquality = regexp.MustCompile("(?i)" +
+	"^\\((samaccountname|cn|userprincipalname|mail|givenname|sn)" +
+	"=([^*()]+)\\)$")
+var filterGroupEquality = regexp.MustCompile("(?i)" +
+	"^\\((samaccountname|cn)=([^*()]+)\\)$")
 
-var controls0 = []string{}
-var controls1 = []string{ldap.ControlTypePaging}
+// userQueryParams maps LDAP attributes to Keycloak user query parameters.
+var userQueryParams = map[string]string{
+	"samaccountname":    "username",
+	"cn":                "username",
+	"userprincipalname": "username",
+	"mail":              "email",
+	"givenname":         "firstName",
+	"sn":                "lastName",
+}
 
 // Handler (Searcher)
 
@@ -188,31 +185,28 @@ func (h keycloakHandler) Search(
 		Str("controls", controls).
 		Msg("Search request")
 
+	// Attribute subsets and filter enforcement are applied by the LDAP
+	// server itself (EnforceLDAP); this handler only narrows the Keycloak
+	// REST query when the filter is a simple equality or the vSphere
+	// wildcard form.
 	if err := h.checkSession(boundDN, true); err != nil {
 		h.log.Error().Err(err).Msg("Search response")
 		return errorSearchResult(), err
 	} else if req.DerefAliases != ldap.NeverDerefAliases ||
-		req.SizeLimit != 0 ||
 		req.TimeLimit != 0 ||
 		req.TypesOnly {
 
 		err := unexpected(fmt.Sprintf("DeferAliases: \"%s\", "+
-			"SizeLimit: %d, "+
 			"TimeLimit: %d, "+
 			"TypesOnly: %t",
 			deferAliases,
-			req.SizeLimit,
 			req.TimeLimit,
 			req.TypesOnly))
 		h.log.Error().Err(err).Msg("Search response")
 		return errorSearchResult(), err
-	} else if _, ok := checkSearchRequest(
-		req,
-		"",
-		ldap.ScopeBaseObject,
-		filterRootDSE,
-		attributes0,
-		controls0); ok {
+	} else if req.BaseDN == "" &&
+		req.Scope == ldap.ScopeBaseObject &&
+		filterRootDSE.MatchString(req.Filter) {
 
 		res := h.rootDSESearchResult()
 		h.log.Debug().
@@ -220,15 +214,11 @@ func (h keycloakHandler) Search(
 			Int("entries", len(res.Entries)).
 			Msg("Search response")
 		return res, nil
-	} else if _, ok := checkSearchRequest(
-		req,
-		h.baseDNUsers,
-		ldap.ScopeWholeSubtree,
-		filterUsers,
-		attributes9,
-		controls1); ok {
+	} else if req.BaseDN == h.baseDNUsers &&
+		req.Scope == ldap.ScopeWholeSubtree {
 
-		if res, err := h.usersSearchResult(""); err != nil {
+		params, prefix := userQuery(req.Filter)
+		if res, err := h.usersSearchResult(params, prefix); err != nil {
 			h.log.Error().Err(err).Msg("Search response")
 			return errorSearchResult(), err
 		} else {
@@ -238,53 +228,24 @@ func (h keycloakHandler) Search(
 				Msg("Search response")
 			return res, nil
 		}
-	} else if prefix, ok := checkSearchRequest(
-		req,
-		h.baseDNUsers,
-		ldap.ScopeWholeSubtree,
-		filterUsersWithPrefix,
-		attributes9,
-		controls1); ok {
+	} else if req.BaseDN == h.baseDNGroups &&
+		req.Scope == ldap.ScopeWholeSubtree {
 
-		if res, err := h.usersSearchResult(prefix); err != nil {
-			h.log.Error().Err(err).Msg("Search response")
+		params, prefix := groupQuery(req.Filter)
+		if res, err := h.groupsSearchResult(params, prefix); err != nil {
 			return errorSearchResult(), err
 		} else {
 			h.log.Debug().
 				Str("BaseDN", req.BaseDN).
-				Str("prefix", prefix).
-				Int("entries", len(res.Entries)).
-				Msg("Search response")
-			return res, nil
-		}
-	} else if prefix, ok := checkSearchRequest(req,
-		h.baseDNGroups,
-		ldap.ScopeWholeSubtree,
-		filterGroupsWithPrefix,
-		attributes3,
-		controls1); ok {
-
-		if res, err := h.groupsSearchResult(prefix); err != nil {
-			return errorSearchResult(), err
-		} else {
-			h.log.Debug().
-				Str("BaseDN", req.BaseDN).
-				Str("prefix", prefix).
 				Int("entries", len(res.Entries)).
 				Msg("Search response")
 			return res, nil
 		}
 	} else {
 		err := unexpected(fmt.Sprintf("BaseDN: \"%s\", "+
-			"Scope: \"%s\", "+
-			"Filter: \"%s\", "+
-			"Attributes: \"%s\", "+
-			"Controls: \"%s\"",
+			"Scope: \"%s\"",
 			req.BaseDN,
-			scope,
-			req.Filter,
-			attributes,
-			controls))
+			scope))
 		h.log.Error().Err(err).Msg("Search response")
 		return errorSearchResult(), err
 	}
@@ -388,10 +349,11 @@ func (h *keycloakHandler) checkSession(boundDN string, refresh bool) error {
 }
 
 func (h *keycloakHandler) groupsSearchResult(
+	params map[string]string,
 	prefix string,
 ) (ldap.ServerSearchResult, error) {
 	groups := &[]keycloakGroup{}
-	err := h.keycloakGet("groups", groups)
+	err := h.keycloakGet("groups", params, groups)
 	if err != nil {
 		return errorSearchResult(), err
 	}
@@ -427,17 +389,20 @@ func (h *keycloakHandler) groupsSearchResult(
 
 func (h *keycloakHandler) keycloakGet(
 	path string,
+	params map[string]string,
 	result interface{},
 ) error {
 	u := h.cfg.restAPIEndpoint(path)
 	h.log.Debug().
 		Str("method", "GET").
 		Str("url", u).
+		Interface("params", params).
 		Msg("Keycloak REST API request")
 
 	res, err := h.restClient.R().
 		SetHeader("Accept", "application/json").
 		SetAuthToken(h.session.token.AccessToken).
+		SetQueryParams(params).
 		SetResult(result).
 		Get(u)
 	if err == nil && res.StatusCode() != http.StatusOK {
@@ -469,10 +434,11 @@ func (h *keycloakHandler) rootDSESearchResult() ldap.ServerSearchResult {
 }
 
 func (h *keycloakHandler) usersSearchResult(
+	params map[string]string,
 	prefix string,
 ) (ldap.ServerSearchResult, error) {
 	users := &[]keycloakUser{}
-	err := h.keycloakGet("users", users)
+	err := h.keycloakGet("users", params, users)
 	if err != nil {
 		return errorSearchResult(), err
 	}
@@ -584,44 +550,61 @@ func NewKeycloakHandler(opts ...Option) Handler {
 	return h
 }
 
-func checkSearchRequest(
-	req ldap.SearchRequest,
-	baseDN string,
-	scope int,
-	filterRegexp *regexp.Regexp,
-	attributes []string,
-	controls []string,
-) (string, bool) {
-	if req.BaseDN != baseDN ||
-		req.Scope != scope ||
-		len(req.Attributes) != len(attributes) ||
-		len(req.Controls) != len(controls) {
-		return "", false
+// unwrapObjectClass strips an optional surrounding
+// (&(objectClass=<objectClass>)...) AND wrapper from filter.
+func unwrapObjectClass(filter, objectClass string) string {
+	pre := "(&(objectclass=" + objectClass + ")"
+	if f := strings.ToLower(filter); strings.HasPrefix(f, pre) &&
+		strings.HasSuffix(f, ")") {
+		return filter[len(pre) : len(filter)-1]
 	}
-	for i, a := range attributes {
-		if req.Attributes[i] != a {
-			return "", false
-		}
-	}
-	for i, c := range controls {
-		if req.Controls[i].GetControlType() != c {
-			return "", false
-		}
-	}
+	return filter
+}
 
-	if g := filterRegexp.FindStringSubmatch(req.Filter); g == nil {
-		return "", false
-	} else if len(g) == 1 {
-		return "", true // no prefix
-	} else {
-		prefix := g[1]
-		for _, gg := range g[2:] {
-			if gg != prefix {
-				return "", false
+// userQuery narrows a users search to Keycloak REST query parameters when
+// the filter is a simple equality on a mapped attribute, or to a prefix
+// for the vSphere wildcard form. For any other filter it returns no
+// narrowing; the LDAP server (EnforceLDAP) applies the filter to the full
+// user list itself.
+func userQuery(filter string) (map[string]string, string) {
+	if m := filterUsersWithPrefix.FindStringSubmatch(filter); m != nil {
+		prefix := m[1]
+		for _, p := range m[2:] {
+			if p != prefix {
+				return nil, ""
 			}
 		}
-		return prefix, true
+		return nil, prefix
 	}
+	if m := filterUserEquality.FindStringSubmatch(
+		unwrapObjectClass(filter, "user")); m != nil {
+		return map[string]string{
+			userQueryParams[strings.ToLower(m[1])]: m[2],
+			"exact":                                "true",
+		}, ""
+	}
+	return nil, ""
+}
+
+// groupQuery narrows a groups search likewise: a prefix for the vSphere
+// wildcard form, or Keycloak's (substring) search parameter for a simple
+// equality on sAMAccountName/cn; the LDAP server refines the result to
+// exact matches itself.
+func groupQuery(filter string) (map[string]string, string) {
+	if m := filterGroupsWithPrefix.FindStringSubmatch(filter); m != nil {
+		prefix := m[1]
+		for _, p := range m[2:] {
+			if p != prefix {
+				return nil, ""
+			}
+		}
+		return nil, prefix
+	}
+	if m := filterGroupEquality.FindStringSubmatch(
+		unwrapObjectClass(filter, "group")); m != nil {
+		return map[string]string{"search": m[2]}, ""
+	}
+	return nil, ""
 }
 
 func clientCredentialsGrant(

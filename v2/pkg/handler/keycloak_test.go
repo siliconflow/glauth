@@ -25,12 +25,74 @@ func TestFilterRootDSE(t *testing.T) {
 	assert.Equal(t, s, g[0])
 }
 
-func TestFilterUsers(t *testing.T) {
-	s := "(objectClass=user)"
-	g := filterUsers.FindStringSubmatch(s)
-	assert.NotNil(t, g)
-	assert.Equal(t, 1, len(g))
-	assert.Equal(t, s, g[0])
+func TestUnwrapObjectClass(t *testing.T) {
+	assert.Equal(t, "(sAMAccountName=a)",
+		unwrapObjectClass("(&(objectClass=user)(sAMAccountName=a))", "user"))
+	assert.Equal(t, "(sAMAccountName=a)",
+		unwrapObjectClass("(&(OBJECTCLASS=USER)(sAMAccountName=a))", "user"))
+	assert.Equal(t, "(sAMAccountName=a)",
+		unwrapObjectClass("(sAMAccountName=a)", "user"))
+	assert.Equal(t, "(|(cn=a)(cn=b))",
+		unwrapObjectClass("(&(objectClass=user)(|(cn=a)(cn=b)))", "user"))
+}
+
+func TestUserQueryEquality(t *testing.T) {
+	params, prefix := userQuery("(sAMAccountName=wangyuqing)")
+	assert.Equal(t, map[string]string{
+		"username": "wangyuqing", "exact": "true"}, params)
+	assert.Equal(t, "", prefix)
+
+	params, prefix = userQuery("(&(objectClass=user)(mail=a@b.c))")
+	assert.Equal(t, map[string]string{
+		"email": "a@b.c", "exact": "true"}, params)
+	assert.Equal(t, "", prefix)
+
+	params, _ = userQuery("(MAIL=a@b.c)")
+	assert.Equal(t, "a@b.c", params["email"])
+
+	params, _ = userQuery("(&(objectClass=user)(sn=Wang))")
+	assert.Equal(t, map[string]string{
+		"lastName": "Wang", "exact": "true"}, params)
+}
+
+func TestUserQueryPrefix(t *testing.T) {
+	params, prefix := userQuery("(&(objectClass=user)(|(sAMAccountName=pre*)" +
+		"(sn=pre*)(givenName=pre*)(cn=pre*)(displayname=pre*)" +
+		"(userPrincipalName=pre*)))")
+	assert.Nil(t, params)
+	assert.Equal(t, "pre", prefix)
+}
+
+func TestUserQueryAll(t *testing.T) {
+	for _, f := range []string{
+		"(objectClass=user)",
+		"(|(cn=a)(cn=b))",
+		"(sAMAccountName=wang*)",
+	} {
+		params, prefix := userQuery(f)
+		assert.Nil(t, params)
+		assert.Equal(t, "", prefix)
+	}
+}
+
+func TestGroupQueryEquality(t *testing.T) {
+	params, prefix := groupQuery("(cn=engineering)")
+	assert.Equal(t, map[string]string{"search": "engineering"}, params)
+	assert.Equal(t, "", prefix)
+
+	params, _ = groupQuery("(&(objectClass=group)(sAMAccountName=engineering))")
+	assert.Equal(t, map[string]string{"search": "engineering"}, params)
+}
+
+func TestGroupQueryPrefix(t *testing.T) {
+	params, prefix := groupQuery(
+		"(&(objectClass=group)(|(sAMAccountName=pre*)(cn=pre*)))")
+	assert.Nil(t, params)
+	assert.Equal(t, "pre", prefix)
+
+	params, prefix = groupQuery("(objectClass=group)")
+	assert.Nil(t, params)
+	assert.Equal(t, "", prefix)
 }
 
 func TestFilterUsersWithPrefix(t *testing.T) {
