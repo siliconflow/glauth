@@ -9,11 +9,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/glauth/glauth/v2/pkg/config"
 	"github.com/glauth/ldap"
+	ber "github.com/go-asn1-ber/asn1-ber"
 	resty "github.com/go-resty/resty/v2"
 	"github.com/rs/zerolog"
 	"golang.org/x/oauth2"
@@ -28,11 +31,20 @@ import (
 type keycloakHandler struct {
 	cfg             *keycloakHandlerConfig
 	log             *zerolog.Logger
+	baseDN          string
 	baseDNUsers     string
 	baseDNGroups    string
 	baseDNBindUsers string
 	restClient      *resty.Client
-	session         *keycloakSession
+	sessions        *keycloakSessions
+}
+
+// keycloakSessions tracks one Keycloak session per LDAP connection; the
+// handler is shared by every connection of its backend. Keyed by
+// connID, as in the other handlers.
+type keycloakSessions struct {
+	mu       sync.Mutex
+	byConnID map[string]*keycloakSession
 }
 
 type keycloakHandlerConfig struct {
@@ -79,28 +91,34 @@ func (h keycloakHandler) Bind(
 
 	pre := "cn="
 	suf := "," + h.baseDNBindUsers
-	if !strings.HasPrefix(bindDN, pre) || !strings.HasSuffix(bindDN, suf) {
+	// DN matching is case-insensitive (RFC 4514); the bind DN is
+	// cn=<clientID>,cn=bind,<domain>.
+	if len(bindDN) < len(pre)+len(suf) ||
+		!strings.EqualFold(bindDN[:len(pre)], pre) ||
+		!strings.EqualFold(bindDN[len(bindDN)-len(suf):], suf) {
 		h.log.Error().
 			Str("base", h.baseDNBindUsers).
 			Msg("invalid bindDN")
 		return ldap.LDAPResultInvalidCredentials, nil
 	}
 
-	clientID := strings.TrimPrefix(strings.TrimSuffix(bindDN, suf), pre)
+	clientID := bindDN[len(pre) : len(bindDN)-len(suf)]
 	clientSecret := bindSimplePw
-	if err := h.session.open(h.cfg.tokenEndpoint(), clientID,
-		clientSecret, bindDN, h.log); err != nil {
+	s, err := h.sessions.open(connID(conn), h.cfg.tokenEndpoint(),
+		clientID, clientSecret, bindDN, h.log)
+	if err != nil {
 		h.log.Error().Err(err).Msg("Bind response")
 		return ldap.LDAPResultInvalidCredentials, nil
 	}
 
 	h.log.Debug().
-		Time("expiry", h.session.token.Expiry).
+		Time("expiry", s.token.Expiry).
 		Msg("Bind response")
 	return ldap.LDAPResultSuccess, nil
 }
 
 var rootDSEAttributes = []string{
+	"objectClass",
 	"configurationNamingContext",
 	"currentTime",
 	"defaultNamingContext",
@@ -124,30 +142,12 @@ var rootDSEAttributes = []string{
 	"supportedLDAPVersion",
 	"supportedSASLMechanisms"}
 
-var filterGroupsWithPrefix = regexp.MustCompile("^\\(&\\(objectClass=group\\)" +
-	"\\(\\|\\(sAMAccountName=(.+)\\*\\)" +
-	"\\(cn=(.*)\\*\\)\\)\\)$")
-var filterRootDSE = regexp.MustCompile("^\\(objectclass=\\*\\)$")
-var filterUsersWithPrefix = regexp.MustCompile("^\\(&\\(objectClass=user\\)" +
-	"\\(\\|\\(sAMAccountName=(.+)\\*\\)" +
-	"\\(sn=(.+)\\*\\)" +
-	"\\(givenName=(.*)\\*\\)" +
-	"\\(cn=(.*)\\*\\)" +
-	"\\(displayname=(.*)\\*\\)" +
-	"\\(userPrincipalName=(.*)\\*\\)\\)\\)$")
-
-// Simple equality filters, optionally wrapped in an objectClass AND.
-var filterUserEquality = regexp.MustCompile("(?i)" +
-	"^\\((samaccountname|cn|userprincipalname|mail|givenname|sn)" +
-	"=([^*()]+)\\)$")
-var filterGroupEquality = regexp.MustCompile("(?i)" +
-	"^\\((samaccountname|cn)=([^*()]+)\\)$")
-
 // userQueryParams maps LDAP attributes to Keycloak user query parameters.
 var userQueryParams = map[string]string{
 	"samaccountname":    "username",
 	"cn":                "username",
 	"userprincipalname": "username",
+	"uid":               "username",
 	"mail":              "email",
 	"givenname":         "firstName",
 	"sn":                "lastName",
@@ -185,70 +185,175 @@ func (h keycloakHandler) Search(
 		Str("controls", controls).
 		Msg("Search request")
 
-	// Attribute subsets and filter enforcement are applied by the LDAP
-	// server itself (EnforceLDAP); this handler only narrows the Keycloak
-	// REST query when the filter is a simple equality or the vSphere
-	// wildcard form.
-	if err := h.checkSession(boundDN, true); err != nil {
+	session, err := h.checkSession(connID(conn), true)
+	if err != nil {
 		h.log.Error().Err(err).Msg("Search response")
-		return errorSearchResult(), err
-	} else if req.DerefAliases != ldap.NeverDerefAliases ||
-		req.TimeLimit != 0 ||
-		req.TypesOnly {
+		return searchError(ldap.LDAPResultOperationsError, "%s", err)
+	}
 
-		err := unexpected(fmt.Sprintf("DeferAliases: \"%s\", "+
-			"TimeLimit: %d, "+
-			"TypesOnly: %t",
-			deferAliases,
-			req.TimeLimit,
-			req.TypesOnly))
+	// TimeLimit is advisory (the client states how long it is willing to
+	// wait; the server is free to ignore it, RFC 4511 4.5.1) and there
+	// are no aliases to dereference, so both are accepted and ignored.
+	// The LDAP server itself (EnforceLDAP) applies filter, scope,
+	// attribute and size-limit enforcement to the returned entries; this
+	// handler only narrows the Keycloak REST query when the filter is a
+	// simple equality.
+	if req.TypesOnly {
+		err := unexpected("TypesOnly: true")
 		h.log.Error().Err(err).Msg("Search response")
-		return errorSearchResult(), err
-	} else if req.BaseDN == "" &&
-		req.Scope == ldap.ScopeBaseObject &&
-		filterRootDSE.MatchString(req.Filter) {
+		return searchError(ldap.LDAPResultUnwillingToPerform, "%s", err)
+	}
 
+	baseDN := normalizeDN(req.BaseDN)
+
+	// Root DSE: base-object search with an empty base DN (RFC 4512 5.1).
+	if baseDN == "" && req.Scope == ldap.ScopeBaseObject {
 		res := h.rootDSESearchResult()
 		h.log.Debug().
 			Str("BaseDN", req.BaseDN).
 			Int("entries", len(res.Entries)).
 			Msg("Search response")
 		return res, nil
-	} else if req.BaseDN == h.baseDNUsers &&
-		req.Scope == ldap.ScopeWholeSubtree {
-
-		params, prefix := userQuery(req.Filter)
-		if res, err := h.usersSearchResult(params, prefix); err != nil {
-			h.log.Error().Err(err).Msg("Search response")
-			return errorSearchResult(), err
-		} else {
-			h.log.Debug().
-				Str("BaseDN", req.BaseDN).
-				Int("entries", len(res.Entries)).
-				Msg("Search response")
-			return res, nil
-		}
-	} else if req.BaseDN == h.baseDNGroups &&
-		req.Scope == ldap.ScopeWholeSubtree {
-
-		params, prefix := groupQuery(req.Filter)
-		if res, err := h.groupsSearchResult(params, prefix); err != nil {
-			return errorSearchResult(), err
-		} else {
-			h.log.Debug().
-				Str("BaseDN", req.BaseDN).
-				Int("entries", len(res.Entries)).
-				Msg("Search response")
-			return res, nil
-		}
-	} else {
-		err := unexpected(fmt.Sprintf("BaseDN: \"%s\", "+
-			"Scope: \"%s\"",
-			req.BaseDN,
-			scope))
-		h.log.Error().Err(err).Msg("Search response")
-		return errorSearchResult(), err
 	}
+
+	var entries []*ldap.Entry
+	addUsers := func() error {
+		e, err := h.usersSearchResult(session, userQuery(req.Filter))
+		if err != nil {
+			h.log.Error().Err(err).Msg("Search response")
+			return err
+		}
+		entries = append(entries, e...)
+		return nil
+	}
+	addGroups := func() error {
+		e, err := h.groupsSearchResult(session, groupQuery(req.Filter))
+		if err != nil {
+			h.log.Error().Err(err).Msg("Search response")
+			return err
+		}
+		entries = append(entries, e...)
+		return nil
+	}
+
+	// The DIT is flat: a domain root holding the cn=users and cn=groups
+	// containers, each holding leaf entries one level deep, so
+	// single-level and subtree searches cover the same leaves. Subtree
+	// scope includes the base object itself (RFC 4511 4.5.1).
+	switch baseDN {
+	case "":
+		entries = append(entries, h.domainEntry())
+		if req.Scope == ldap.ScopeWholeSubtree {
+			entries = append(entries,
+				h.rootDSESearchResult().Entries...,
+			)
+			entries = append(entries,
+				containerEntry(h.baseDNUsers, "users"),
+				containerEntry(h.baseDNGroups, "groups"))
+			if err := addUsers(); err != nil {
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+			if err := addGroups(); err != nil {
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+		}
+	case h.baseDN:
+		switch req.Scope {
+		case ldap.ScopeBaseObject:
+			entries = append(entries, h.domainEntry())
+		case ldap.ScopeSingleLevel:
+			entries = append(entries,
+				containerEntry(h.baseDNUsers, "users"),
+				containerEntry(h.baseDNGroups, "groups"))
+		default:
+			entries = append(entries, h.domainEntry(),
+				containerEntry(h.baseDNUsers, "users"),
+				containerEntry(h.baseDNGroups, "groups"))
+			if err := addUsers(); err != nil {
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+			if err := addGroups(); err != nil {
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+		}
+	case h.baseDNUsers, h.baseDNGroups:
+		users := baseDN == h.baseDNUsers
+		name := "groups"
+		if users {
+			name = "users"
+		}
+		if req.Scope != ldap.ScopeSingleLevel {
+			entries = append(entries, containerEntry(baseDN, name))
+		}
+		if req.Scope != ldap.ScopeBaseObject {
+			var err error
+			if users {
+				err = addUsers()
+			} else {
+				err = addGroups()
+			}
+			if err != nil {
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+		}
+	default:
+		// Base-object or single-level search on a single entry:
+		// cn=<name>,<container>. Narrow by the RDN value; EnforceLDAP
+		// keeps only the entry whose DN equals the base (base scope) and
+		// drops it for single-level scope (a leaf has no subordinates).
+		head, rest := splitDN(req.BaseDN)
+		attr, value, ok := parseRDN(head)
+		if ok && strings.EqualFold(attr, "cn") {
+			switch normalizeDN(rest) {
+			case h.baseDNUsers:
+				e, err := h.usersSearchResult(session,
+					map[string]string{"username": value, "exact": "true"})
+				if err != nil {
+					h.log.Error().Err(err).Msg("Search response")
+					return searchError(ldap.LDAPResultOperationsError, "%s", err)
+				}
+				if len(e) == 0 {
+					err := fmt.Errorf("no such object: %s", req.BaseDN)
+					h.log.Error().Err(err).Msg("Search response")
+					return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
+				}
+				entries = e
+			case h.baseDNGroups:
+				e, err := h.groupsSearchResult(session,
+					map[string]string{"search": value})
+				if err != nil {
+					h.log.Error().Err(err).Msg("Search response")
+					return searchError(ldap.LDAPResultOperationsError, "%s", err)
+				}
+				if len(e) == 0 {
+					err := fmt.Errorf("no such object: %s", req.BaseDN)
+					h.log.Error().Err(err).Msg("Search response")
+					return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
+				}
+				entries = e
+			default:
+				ok = false
+			}
+		}
+		if !ok {
+			err := fmt.Errorf("no such object: %s", req.BaseDN)
+			h.log.Error().Err(err).Msg("Search response")
+			return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
+		}
+	}
+
+	res := ldap.ServerSearchResult{
+		Entries:    entries,
+		Referrals:  nil,
+		Controls:   nil,
+		ResultCode: ldap.LDAPResultSuccess,
+	}
+	h.log.Debug().
+		Str("BaseDN", req.BaseDN).
+		Str("scope", scope).
+		Int("entries", len(res.Entries)).
+		Msg("Search response")
+	return res, nil
 }
 
 // Handler (Closer)
@@ -260,13 +365,12 @@ func (h keycloakHandler) Close(
 	h.log.Debug().
 		Str("boundDN", boundDN).
 		Msg("Close request")
-	if err := h.checkSession(boundDN, false); err != nil {
+	if _, err := h.checkSession(connID(conn), false); err != nil {
 		h.log.Error().Err(err).Msg("Close response")
 		return err
 	}
 
-	h.session.token = nil
-	h.session.boundDN = nil
+	h.sessions.remove(connID(conn))
 	h.log.Debug().Msg("Close response")
 	return nil
 }
@@ -337,57 +441,127 @@ func (h keycloakHandler) FindGroup(
 	return false, group, unexpected("FindGroup")
 }
 
-func (h *keycloakHandler) checkSession(boundDN string, refresh bool) error {
-	if h.session == nil {
-		return errors.New("no session")
-	} else if h.session.boundDN == nil || *h.session.boundDN != boundDN {
-		return fmt.Errorf("unexpected boundDN: %s", boundDN)
-	} else if !refresh {
-		return nil
+func (h *keycloakHandler) checkSession(
+	id string,
+	refresh bool,
+) (*keycloakSession, error) {
+	if h.sessions == nil {
+		return nil, errors.New("no session")
 	}
-	return h.session.refresh(h.cfg.tokenEndpoint(), h.log)
+	s := h.sessions.get(id)
+	if s == nil {
+		return nil, fmt.Errorf("no session for connection: %s", id)
+	}
+	if !refresh {
+		return s, nil
+	}
+	if err := s.refresh(h.cfg.tokenEndpoint(), h.log); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
-func (h *keycloakHandler) groupsSearchResult(
-	params map[string]string,
-	prefix string,
-) (ldap.ServerSearchResult, error) {
-	groups := &[]keycloakGroup{}
-	err := h.keycloakGet("groups", params, groups)
+func (ss *keycloakSessions) open(
+	id string,
+	tokenEndpoint string,
+	clientID string,
+	clientSecret string,
+	bindDN string,
+	log *zerolog.Logger,
+) (*keycloakSession, error) {
+	token, err := clientCredentialsGrant(tokenEndpoint,
+		clientID, clientSecret, log)
 	if err != nil {
-		return errorSearchResult(), err
+		return nil, err
 	}
+	s := &keycloakSession{
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		boundDN:      &bindDN,
+		token:        token,
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	ss.byConnID[id] = s
+	return s, nil
+}
 
-	e := make([]*ldap.Entry, 0, len(*groups))
-	for _, group := range *groups {
-		if !strings.HasPrefix(group.Name, prefix) {
-			continue
+func (ss *keycloakSessions) get(id string) *keycloakSession {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.byConnID[id]
+}
+
+func (ss *keycloakSessions) remove(id string) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	delete(ss.byConnID, id)
+}
+
+// keycloakPageSize is the page size used when listing users and groups;
+// Keycloak's users endpoint otherwise silently truncates at its default
+// maximum of 100 results.
+const keycloakPageSize = 500
+
+// groupsSearchResult lists all realm groups, narrowed by params (a
+// substring "search" for simple equality filters), and returns them as
+// LDAP entries. The LDAP server refines the result with the actual
+// filter, so narrowing only ever needs to be a superset.
+func (h *keycloakHandler) groupsSearchResult(
+	s *keycloakSession,
+	params map[string]string,
+) ([]*ldap.Entry, error) {
+	e := []*ldap.Entry{}
+	prevFirstID := ""
+	for first := 0; ; first += keycloakPageSize {
+		page := &[]keycloakGroup{}
+		p := make(map[string]string, len(params)+2)
+		for k, v := range params {
+			p[k] = v
 		}
-
-		a := make([]*ldap.EntryAttribute, 5)
-		o := sid(group.Name, h.cfg.keycloakDomain)
-		a[0] = newAttribute("objectClass", "group")
-		a[1] = newAttribute("sAMAccountName", group.Name)
-		a[2] = newAttribute("cn", group.Name)
-		a[3] = newAttribute("description", group.Name)
-		a[4] = newAttribute("objectSid", string(o))
-		h.log.Debug().
-			Str("name", group.Name).
-			Str("objectSid", sidToString(o)).
-			Msg("group")
-
-		dn := fmt.Sprintf("cn=%s,%s", group.Name, h.baseDNGroups)
-		e = append(e, &ldap.Entry{DN: dn, Attributes: a})
+		p["first"] = strconv.Itoa(first)
+		p["max"] = strconv.Itoa(keycloakPageSize)
+		if err := h.keycloakGet(s, "groups", p, page); err != nil {
+			return nil, err
+		}
+		if len(*page) == 0 ||
+			(first > 0 && (*page)[0].Id == prevFirstID) {
+			// Empty page, or the server ignored pagination.
+			break
+		}
+		prevFirstID = (*page)[0].Id
+		for _, group := range *page {
+			e = append(e, h.groupEntry(group))
+		}
+		if len(*page) < keycloakPageSize {
+			break
+		}
 	}
+	return e, nil
+}
 
-	return ldap.ServerSearchResult{
-		Entries:    e,
-		Referrals:  nil,
-		Controls:   nil,
-		ResultCode: ldap.LDAPResultSuccess}, nil
+// groupEntry renders a Keycloak group as an LDAP group entry.
+func (h *keycloakHandler) groupEntry(group keycloakGroup) *ldap.Entry {
+	o := sid(group.Id, h.cfg.keycloakDomain)
+	h.log.Debug().
+		Str("name", group.Name).
+		Str("objectSid", sidToString(o)).
+		Msg("group")
+	return &ldap.Entry{
+		DN: fmt.Sprintf("cn=%s,%s",
+			escapeDNValue(group.Name), h.baseDNGroups),
+		Attributes: []*ldap.EntryAttribute{
+			{Name: "objectClass", Values: []string{"top", "group"}},
+			newAttribute("sAMAccountName", group.Name),
+			newAttribute("cn", group.Name),
+			newAttribute("description", group.Name),
+			newAttribute("objectSid", string(o)),
+		},
+	}
 }
 
 func (h *keycloakHandler) keycloakGet(
+	s *keycloakSession,
 	path string,
 	params map[string]string,
 	result interface{},
@@ -401,7 +575,7 @@ func (h *keycloakHandler) keycloakGet(
 
 	res, err := h.restClient.R().
 		SetHeader("Accept", "application/json").
-		SetAuthToken(h.session.token.AccessToken).
+		SetAuthToken(s.token.AccessToken).
 		SetQueryParams(params).
 		SetResult(result).
 		Get(u)
@@ -416,12 +590,26 @@ func (h *keycloakHandler) keycloakGet(
 	return nil
 }
 
+// rootDSESearchResult returns the root DSE (RFC 4512 5.1). Clients read
+// namingContexts from it to discover base DNs, so the discovery-critical
+// attributes carry real values.
 func (h *keycloakHandler) rootDSESearchResult() ldap.ServerSearchResult {
+	values := map[string][]string{
+		"objectClass":          {"top"},
+		"currentTime":          {time.Now().UTC().Format("20060102150405Z")},
+		"defaultNamingContext": {h.baseDN},
+		"dnsHostName":          {h.cfg.keycloakHostname},
+		"ldapServiceName":      {h.cfg.keycloakHostname},
+		"namingContexts":       {h.baseDN},
+		"supportedLDAPVersion": {"3"},
+	}
 	a := make([]*ldap.EntryAttribute, len(rootDSEAttributes))
 	for i, name := range rootDSEAttributes {
-		a[i] = &ldap.EntryAttribute{
-			Name:   name,
-			Values: []string{""}}
+		v, ok := values[name]
+		if !ok {
+			v = []string{""}
+		}
+		a[i] = &ldap.EntryAttribute{Name: name, Values: v}
 	}
 	e := &ldap.Entry{DN: "", Attributes: a}
 
@@ -433,45 +621,97 @@ func (h *keycloakHandler) rootDSESearchResult() ldap.ServerSearchResult {
 	}
 }
 
+// usersSearchResult lists realm users, narrowed by params for simple
+// equality filters, and returns them as LDAP entries. The LDAP server
+// refines the result with the actual filter, so narrowing only ever
+// needs to be a superset. Results are paged: Keycloak's users endpoint
+// silently truncates at its default maximum of 100 results otherwise.
 func (h *keycloakHandler) usersSearchResult(
+	s *keycloakSession,
 	params map[string]string,
-	prefix string,
-) (ldap.ServerSearchResult, error) {
-	users := &[]keycloakUser{}
-	err := h.keycloakGet("users", params, users)
-	if err != nil {
-		return errorSearchResult(), err
-	}
-
-	e := make([]*ldap.Entry, 0, len(*users))
-	for _, user := range *users {
-		if !strings.HasPrefix(user.Username, prefix) &&
-			!strings.HasPrefix(user.LastName, prefix) {
-			continue
+) ([]*ldap.Entry, error) {
+	e := []*ldap.Entry{}
+	prevFirstID := ""
+	for first := 0; ; first += keycloakPageSize {
+		page := &[]keycloakUser{}
+		p := make(map[string]string, len(params)+2)
+		for k, v := range params {
+			p[k] = v
 		}
-
-		a := make([]*ldap.EntryAttribute, 7)
-		a[0] = newAttribute("objectClass", "user")
-		a[1] = newAttribute("sAMAccountName", user.Username)
-		a[2] = newAttribute("cn", user.Username)
-		a[3] = newAttribute("givenName", user.FirstName)
-		a[4] = newAttribute("sn", user.LastName)
-		a[5] = newAttribute("mail", user.Email)
-		a[6] = newAttribute("description", "")
-
-		h.log.Debug().
-			Str("username", user.Username).
-			Msg("user")
-
-		dn := fmt.Sprintf("cn=%s,%s", user.Username, h.baseDNUsers)
-		e = append(e, &ldap.Entry{DN: dn, Attributes: a})
+		p["first"] = strconv.Itoa(first)
+		p["max"] = strconv.Itoa(keycloakPageSize)
+		if err := h.keycloakGet(s, "users", p, page); err != nil {
+			return nil, err
+		}
+		if len(*page) == 0 ||
+			(first > 0 && (*page)[0].Id == prevFirstID) {
+			// Empty page, or the server ignored pagination.
+			break
+		}
+		prevFirstID = (*page)[0].Id
+		for _, user := range *page {
+			e = append(e, h.userEntry(user))
+		}
+		if len(*page) < keycloakPageSize {
+			break
+		}
 	}
+	return e, nil
+}
 
-	return ldap.ServerSearchResult{
-		Entries:    e,
-		Referrals:  nil,
-		Controls:   nil,
-		ResultCode: ldap.LDAPResultSuccess}, nil
+// userEntry renders a Keycloak user as an LDAP user entry. The
+// attributes cover every attribute the query narrowing maps, so that
+// server-side filter enforcement (EnforceLDAP) can match them.
+func (h *keycloakHandler) userEntry(user keycloakUser) *ldap.Entry {
+	displayName := strings.TrimSpace(user.FirstName + " " + user.LastName)
+	if displayName == "" {
+		displayName = user.Username
+	}
+	h.log.Debug().
+		Str("username", user.Username).
+		Msg("user")
+	return &ldap.Entry{
+		DN: fmt.Sprintf("cn=%s,%s",
+			escapeDNValue(user.Username), h.baseDNUsers),
+		Attributes: []*ldap.EntryAttribute{
+			{Name: "objectClass", Values: []string{
+				"top", "person", "organizationalPerson",
+				"inetOrgPerson", "user"}},
+			newAttribute("sAMAccountName", user.Username),
+			newAttribute("cn", user.Username),
+			newAttribute("uid", user.Username),
+			newAttribute("givenName", user.FirstName),
+			newAttribute("sn", user.LastName),
+			newAttribute("displayName", displayName),
+			newAttribute("userPrincipalName",
+				user.Username+"@"+h.cfg.keycloakDomain),
+			newAttribute("mail", user.Email),
+			newAttribute("description", ""),
+		},
+	}
+}
+
+// domainEntry renders the naming context root.
+func (h *keycloakHandler) domainEntry() *ldap.Entry {
+	dc := strings.SplitN(h.cfg.keycloakDomain, ".", 2)[0]
+	return &ldap.Entry{
+		DN: h.baseDN,
+		Attributes: []*ldap.EntryAttribute{
+			{Name: "objectClass", Values: []string{"top", "domain"}},
+			newAttribute("dc", dc),
+		},
+	}
+}
+
+// containerEntry renders the cn=users / cn=groups containers.
+func containerEntry(dn, name string) *ldap.Entry {
+	return &ldap.Entry{
+		DN: dn,
+		Attributes: []*ldap.EntryAttribute{
+			{Name: "objectClass", Values: []string{"top", "container"}},
+			newAttribute("cn", name),
+		},
+	}
 }
 
 func (c *keycloakHandlerConfig) restAPIEndpoint(path string) string {
@@ -488,25 +728,6 @@ func (c *keycloakHandlerConfig) tokenEndpoint() string {
 		c.keycloakHostname,
 		c.keycloakPort,
 		c.keycloakRealm)
-}
-
-func (s *keycloakSession) open(
-	tokenEndpoint string,
-	clientID string,
-	clientSecret string,
-	bindDN string,
-	log *zerolog.Logger,
-) error {
-	token, err := clientCredentialsGrant(tokenEndpoint,
-		clientID, clientSecret, log)
-	if err != nil {
-		return err
-	}
-	s.clientID = clientID
-	s.clientSecret = clientSecret
-	s.boundDN = &bindDN
-	s.token = token
-	return nil
 }
 
 func (s *keycloakSession) refresh(
@@ -542,69 +763,254 @@ func NewKeycloakHandler(opts ...Option) Handler {
 
 	b := "dc=" + strings.Replace(c.keycloakDomain, ".", ",dc=", -1)
 	h.cfg = c
-	h.baseDNUsers = "cn=users," + b
-	h.baseDNGroups = "cn=groups," + b
-	h.baseDNBindUsers = "cn=bind," + b
+	// Base DNs are stored normalized so that request base DNs can be
+	// compared case-insensitively (RFC 4514).
+	h.baseDN = normalizeDN(b)
+	h.baseDNUsers = "cn=users," + h.baseDN
+	h.baseDNGroups = "cn=groups," + h.baseDN
+	h.baseDNBindUsers = "cn=bind," + h.baseDN
 	h.restClient = resty.New()
-	h.session = &keycloakSession{}
+	h.sessions = &keycloakSessions{
+		byConnID: map[string]*keycloakSession{},
+	}
 	return h
 }
 
-// unwrapObjectClass strips an optional surrounding
-// (&(objectClass=<objectClass>)...) AND wrapper from filter.
-func unwrapObjectClass(filter, objectClass string) string {
-	pre := "(&(objectclass=" + objectClass + ")"
-	if f := strings.ToLower(filter); strings.HasPrefix(f, pre) &&
-		strings.HasSuffix(f, ")") {
-		return filter[len(pre) : len(filter)-1]
+// objectClassesUser/list the objectClass values the handler emits on user
+// and group entries. An LDAP filter may anchor on any one of them
+// (typically inetOrgPerson or group), so query narrowing accepts any
+// and strips the objectClass equality before extracting parameters.
+var (
+	objectClassesUser  = []string{"top", "person", "organizationalPerson", "inetOrgPerson", "user"}
+	objectClassesGroup = []string{"top", "group"}
+)
+
+// unwrapObjectClass strips any objectClass equalities from a parsed
+// filter whose value is in objectClasses, returning the remaining
+// children: the single remaining child when there is one, an AND
+// rebuilt over several, or nil when only objectClass equalities were
+// present. A non-AND filter with no objectClass equality is returned
+// unchanged.
+func unwrapObjectClass(f *ber.Packet, objectClasses []string) *ber.Packet {
+	if f.Tag != ldap.FilterAnd {
+		if v, ok := equalityValue(f, "objectclass"); ok && containsFold(objectClasses, v) {
+			return nil
+		}
+		return f
 	}
-	return filter
+	var rest []*ber.Packet
+	for _, c := range f.Children {
+		if v, ok := equalityValue(c, "objectclass"); ok && containsFold(objectClasses, v) {
+			continue
+		}
+		rest = append(rest, c)
+	}
+	switch len(rest) {
+	case 0:
+		return nil
+	case 1:
+		return rest[0]
+	default:
+		and := ber.Encode(ber.ClassContext, ber.TypeConstructed,
+			ldap.FilterAnd, nil, ldap.FilterMap[ldap.FilterAnd])
+		for _, c := range rest {
+			and.AppendChild(c)
+		}
+		return and
+	}
+}
+
+// containsFold reports whether list holds s, case-insensitively.
+func containsFold(list []string, s string) bool {
+	for _, e := range list {
+		if strings.EqualFold(e, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// equalityValue returns the value of an equality-match filter child on
+// attribute (case-insensitive).
+func equalityValue(f *ber.Packet, attribute string) (string, bool) {
+	if f.Tag != ldap.FilterEqualityMatch || len(f.Children) != 2 {
+		return "", false
+	}
+	attr, ok1 := f.Children[0].Value.(string)
+	value, ok2 := f.Children[1].Value.(string)
+	if !ok1 || !ok2 || !strings.EqualFold(attr, attribute) {
+		return "", false
+	}
+	return value, true
 }
 
 // userQuery narrows a users search to Keycloak REST query parameters when
-// the filter is a simple equality on a mapped attribute, or to a prefix
-// for the vSphere wildcard form. For any other filter it returns no
-// narrowing; the LDAP server (EnforceLDAP) applies the filter to the full
-// user list itself.
-func userQuery(filter string) (map[string]string, string) {
-	if m := filterUsersWithPrefix.FindStringSubmatch(filter); m != nil {
-		prefix := m[1]
-		for _, p := range m[2:] {
-			if p != prefix {
-				return nil, ""
+// the filter reduces (after stripping any objectClass equality) to one or
+// more equality matches on mapped attributes. For any other filter it
+// returns no narrowing; the LDAP server (EnforceLDAP) applies the filter
+// to the full user list itself.
+func userQuery(filter string) map[string]string {
+	f, err := ldap.CompileFilter(filter)
+	if err != nil {
+		return nil
+	}
+	f = unwrapObjectClass(f, objectClassesUser)
+	if f == nil {
+		return nil
+	}
+	children := equalityChildren(f)
+	if children == nil {
+		return nil
+	}
+	params := map[string]string{}
+	for _, c := range children {
+		for attr, param := range userQueryParams {
+			if value, ok := equalityValue(c, attr); ok {
+				params[param] = value
 			}
 		}
-		return nil, prefix
 	}
-	if m := filterUserEquality.FindStringSubmatch(
-		unwrapObjectClass(filter, "user")); m != nil {
-		return map[string]string{
-			userQueryParams[strings.ToLower(m[1])]: m[2],
-			"exact":                                "true",
-		}, ""
+	if len(params) == 0 {
+		return nil
 	}
-	return nil, ""
+	params["exact"] = "true"
+	return params
 }
 
-// groupQuery narrows a groups search likewise: a prefix for the vSphere
-// wildcard form, or Keycloak's (substring) search parameter for a simple
-// equality on sAMAccountName/cn; the LDAP server refines the result to
-// exact matches itself.
-func groupQuery(filter string) (map[string]string, string) {
-	if m := filterGroupsWithPrefix.FindStringSubmatch(filter); m != nil {
-		prefix := m[1]
-		for _, p := range m[2:] {
-			if p != prefix {
-				return nil, ""
+// groupQuery narrows a groups search likewise, to Keycloak's (substring)
+// search parameter for a simple equality on sAMAccountName/cn; the LDAP
+// server refines the result to exact matches itself.
+func groupQuery(filter string) map[string]string {
+	f, err := ldap.CompileFilter(filter)
+	if err != nil {
+		return nil
+	}
+	f = unwrapObjectClass(f, objectClassesGroup)
+	if f == nil {
+		return nil
+	}
+	children := equalityChildren(f)
+	if children == nil {
+		return nil
+	}
+	for _, c := range children {
+		for _, attr := range []string{"samaccountname", "cn"} {
+			if value, ok := equalityValue(c, attr); ok {
+				return map[string]string{"search": value}
 			}
 		}
-		return nil, prefix
 	}
-	if m := filterGroupEquality.FindStringSubmatch(
-		unwrapObjectClass(filter, "group")); m != nil {
-		return map[string]string{"search": m[2]}, ""
+	return nil
+}
+
+// equalityChildren returns the equality-match children of f: f itself
+// when it is an equality match, the AND's children when f is a non-empty
+// AND, or nil when f is an unsupported filter shape (OR/NOT/substring/
+// present/...) or an AND holding any non-equality child.
+func equalityChildren(f *ber.Packet) []*ber.Packet {
+	if f.Tag == ldap.FilterEqualityMatch {
+		return []*ber.Packet{f}
 	}
-	return nil, ""
+	if f.Tag != ldap.FilterAnd {
+		return nil
+	}
+	for _, c := range f.Children {
+		if c.Tag != ldap.FilterEqualityMatch {
+			return nil
+		}
+	}
+	return f.Children
+}
+
+// normalizeDN folds case and insignificant whitespace so that DNs can be
+// compared as plain strings (attribute types and the attribute values
+// used here are case-insensitive per RFC 4512).
+func normalizeDN(dn string) string {
+	rdns := strings.Split(dn, ",")
+	for i, rdn := range rdns {
+		rdn = strings.TrimSpace(rdn)
+		if j := strings.Index(rdn, "="); j >= 0 {
+			rdn = strings.TrimSpace(rdn[:j]) + "=" +
+				strings.TrimSpace(rdn[j+1:])
+		}
+		rdns[i] = rdn
+	}
+	return strings.ToLower(strings.Join(rdns, ","))
+}
+
+// splitDN splits dn at its first unescaped comma.
+func splitDN(dn string) (head, rest string) {
+	for i := 0; i < len(dn); i++ {
+		switch dn[i] {
+		case '\\':
+			i++
+		case ',':
+			return dn[:i], dn[i+1:]
+		}
+	}
+	return dn, ""
+}
+
+// parseRDN parses a single-attribute RDN ("cn=alice"), unescaping the
+// value per RFC 4514.
+func parseRDN(rdn string) (attr, value string, ok bool) {
+	eq := -1
+	for i := 0; i < len(rdn); i++ {
+		switch rdn[i] {
+		case '\\':
+			i++
+		case '=':
+			eq = i
+		}
+		if eq >= 0 {
+			break
+		}
+	}
+	if eq < 0 {
+		return "", "", false
+	}
+	attr = strings.TrimSpace(rdn[:eq])
+	raw := strings.TrimSpace(rdn[eq+1:])
+	var sb strings.Builder
+	for i := 0; i < len(raw); i++ {
+		if raw[i] == '\\' && i+1 < len(raw) {
+			if i+2 < len(raw) && isHex(raw[i+1]) && isHex(raw[i+2]) {
+				b, _ := strconv.ParseUint(raw[i+1:i+3], 16, 8)
+				sb.WriteByte(byte(b))
+				i += 2
+			} else {
+				sb.WriteByte(raw[i+1])
+				i++
+			}
+		} else {
+			sb.WriteByte(raw[i])
+		}
+	}
+	return attr, sb.String(), true
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+// escapeDNValue escapes a value for use in a DN per RFC 4514.
+func escapeDNValue(v string) string {
+	var sb strings.Builder
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c == 0:
+			sb.WriteString("\\00")
+			continue
+		case c == ',' || c == '+' || c == '"' || c == '\\' ||
+			c == '<' || c == '>' || c == ';' || c == '=' ||
+			(i == 0 && (c == ' ' || c == '#')) ||
+			(i == len(v)-1 && c == ' '):
+			sb.WriteByte('\\')
+		}
+		sb.WriteByte(c)
+	}
+	return sb.String()
 }
 
 func clientCredentialsGrant(
@@ -640,12 +1046,18 @@ func clientCredentialsGrant(
 	}
 }
 
-func errorSearchResult() ldap.ServerSearchResult {
+// searchError builds a failed search result with the given result code;
+// the LDAP server reports that code to the client.
+func searchError(
+	code ldap.LDAPResultCode,
+	format string,
+	args ...interface{},
+) (ldap.ServerSearchResult, error) {
 	return ldap.ServerSearchResult{
 		Entries:    make([]*ldap.Entry, 0),
 		Referrals:  []string{},
 		Controls:   []ldap.Control{},
-		ResultCode: ldap.LDAPResultOperationsError}
+		ResultCode: code}, fmt.Errorf(format, args...)
 }
 
 func newAttribute(name, value string) *ldap.EntryAttribute {
@@ -680,11 +1092,8 @@ func newKeycloakHandlerConfig(
 
 // https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-sid
 func sid(id, domain string) []byte {
-	h := sha1.New()
-	d := h.Sum([]byte(domain))
-
-	h = sha1.New()
-	i := h.Sum([]byte(id))
+	d := sha1.Sum([]byte(domain))
+	i := sha1.Sum([]byte(id))
 
 	b := make([]byte, 1+1+6+5*4)
 	b[0] = 1
@@ -709,7 +1118,7 @@ func sidToString(b []byte) string {
 		uint64(binary.BigEndian.Uint32(b[4:8]))
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("S-%d-%d", r, ia))
-	for i := 0; i < n; i++ {
+	for i := range n {
 		sa := binary.LittleEndian.Uint32(b[8+4*i : 8+4*i+4])
 		sb.WriteString(fmt.Sprintf("-%d", sa))
 	}
