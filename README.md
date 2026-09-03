@@ -97,15 +97,63 @@ Here's a sample config wth hardcoded users and groups:
 
 More configuration options are documented [here](https://glauth.github.io/docs/file.html) and in this [sample file](https://github.com/glauth/glauth/blob/master/v2/sample-simple.cfg)
 
-### Backends:
+#### Keycloak backend
 
-For advanced users, GLAuth supports pluggable backends.  Currently, it can use a local file, S3 or an existing LDAP infrastructure.  Through the use of optional plugins, you can connect SQL databases, PAM, and other datastores.
+`datastore = "keycloak"` exposes a Keycloak realm over LDAP (read-only), so that Keycloak can act as an identity provider for services such as vSphere, even without LDAP user federation.
 
 ```toml
 [backend]
-  datastore = "ldap"
-  servers = [ "ldaps://server1:636", "ldaps://server2:636" ]
+  datastore = "keycloak"
+  keycloakhostname = "idp.example.com"   # Keycloak server (HTTPS only)
+  keycloakport = 8443                    # HTTPS port (defaults to 8443)
+  keycloakrealm = "master"               # Realm whose users/groups are exposed
+  keycloakdomain = "example.com"         # DNS domain deriving base DNs and objectSids
+  keycloakclientid = "glauth"            # Client for user password binds and their searches
+  keycloakclientsecret = "..."           # Secret of that client
 ```
+
+Users and groups of the realm appear under `cn=users,<base>` and `cn=groups,<base>`, where `<base>` is `dc=example,dc=com` for `keycloakdomain = "example.com"`.
+
+Two bind forms are supported:
+
+**Service accounts** (OAuth 2.0 client credentials grant, one grant per connection, token refreshed automatically): the bind DN username is the Keycloak `client_id` and the bind password is the client `client_secret`:
+
+```
+ldapsearch ... -D "cn=<client_id>,cn=bind,dc=example,dc=com" -w "<client_secret>" \
+  -b "cn=users,dc=example,dc=com" "(objectClass=user)"
+```
+
+**Users** (OAuth 2.0 resource owner password credentials grant, i.e. Keycloak's *direct access grants*): the bind DN username is the Keycloak username and the bind password is the user's password. The password is validated against the realm's token endpoint using the configured `keycloakclientid`/`keycloakclientsecret`; on success the connection's searches run as that client's service account:
+
+```
+ldapsearch ... -D "cn=<username>,cn=users,dc=example,dc=com" -w "<user_password>" \
+  -b "cn=users,dc=example,dc=com" "(objectClass=user)"
+```
+
+Searches accept arbitrary LDAP filters and attribute subsets over the users and groups containers. Simple equality filters on `sAMAccountName`/`cn`/`userPrincipalName`/`mail`/`givenName`/`sn` (groups: `sAMAccountName`/`cn`) are pushed down to Keycloak REST queries; all other filters are evaluated server-side over the full list. Results are limited to Keycloak's default page size (100 entries) when listing everything.
+
+Service-account clients must be confidential with *Service accounts roles* enabled; give the service account the `realm-management` roles `view-users`, `query-users` and `query-groups`. The client named by `keycloakclientid` additionally needs *Direct access grants* enabled to validate user passwords. Add/Modify/Delete are not supported (read-only proxy). A complete example is in [sample-keycloak.cfg](https://github.com/glauth/glauth/blob/master/v2/sample-keycloak.cfg).
+
+### Docker and Kubernetes:
+
+Build an image directly from source (no pre-built binaries needed):
+
+```sh
+cd v2
+docker build -f docker/Dockerfile -t glauth:local .
+docker run -d -p 3893:3893 -v /path/to/config-dir:/app/config:ro glauth:local
+```
+
+The container reads `/app/config/config.cfg` (a default config is used when the file is absent). `docker/Dockerfile-standalone` and `docker/Dockerfile-plugins` remain the release images, driven by `make builddocker` with cross-compiled binaries.
+
+A Helm chart is provided at `v2/helm/glauth`:
+
+```sh
+helm install glauth v2/helm/glauth \
+  --set-file config=/path/to/config.cfg
+```
+
+The chart renders the TOML config into a ConfigMap (or use `existingConfigMap` / `existingSecret` for configs containing credentials), exposes the LDAP/LDAPS/API ports through a Service, and probes the LDAP port for liveness/readiness.
 
 # Stargazers over time
 

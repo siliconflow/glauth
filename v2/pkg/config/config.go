@@ -20,6 +20,12 @@ type (
 		Database                  string // For Database backends only
 		GroupWithSearchCapability string // For PamLinux backend only
 		AnonymousDSE              bool   // For Config and Database backends only
+		KeycloakHostname          string // For Keycloak backend only
+		KeycloakPort              int    // For Keycloak backend only (defaults to 8443)
+		KeycloakRealm             string // For Keycloak backend only
+		KeycloakDomain            string // For Keycloak backend only; DNS domain used to derive base DNs and objectSids
+		KeycloakClientID          string // For Keycloak backend only; client for user password binds (direct access grants) and their searches
+		KeycloakClientSecret      string // For Keycloak backend only
 	}
 
 	Helper struct {

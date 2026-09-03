@@ -19,3 +19,4 @@ go.work.sum
 # gomocks auto-generated
 **/mock_*.go
 
+keycloak-proxy.cfg

@@ -1,0 +1,21 @@
+GLAuth has been deployed.
+
+1. Get the LDAP endpoint:
+
+{{- if contains "NodePort" .Values.service.type }}
+   export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[?(@.name=='ldap')].nodePort}" services {{ include "glauth.fullname" . }})
+   export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+   echo "LDAP available at ldap://$NODE_IP:$NODE_PORT"
+{{- else if contains "LoadBalancer" .Values.service.type }}
+   export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "glauth.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+   echo "LDAP available at ldap://$SERVICE_IP:{{ .Values.service.ports.ldap.port }}"
+{{- else }}
+   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "glauth.fullname" . }} {{ .Values.service.ports.ldap.port }}:ldap
+   echo "LDAP available at ldap://127.0.0.1:{{ .Values.service.ports.ldap.port }}"
+{{- end }}
+
+2. Test it (with the default embedded users):
+
+   ldapsearch -LLL -x -H ldap://127.0.0.1:{{ .Values.service.ports.ldap.port }} \
+     -D cn=serviceuser,ou=svcaccts,dc=glauth,dc=com -w mysecret \
+     -b dc=glauth,dc=com "(cn=*)"
