@@ -108,20 +108,31 @@ More configuration options are documented [here](https://glauth.github.io/docs/f
   keycloakport = 8443                    # HTTPS port (defaults to 8443)
   keycloakrealm = "master"               # Realm whose users/groups are exposed
   keycloakdomain = "example.com"         # DNS domain deriving base DNs and objectSids
+  keycloakclientid = "glauth"            # Client for user password binds and their searches
+  keycloakclientsecret = "..."           # Secret of that client
 ```
 
 Users and groups of the realm appear under `cn=users,<base>` and `cn=groups,<base>`, where `<base>` is `dc=example,dc=com` for `keycloakdomain = "example.com"`.
 
-LDAP binds authenticate as Keycloak **service accounts** (OAuth 2.0 client credentials grant, one grant per connection, token refreshed automatically): the bind DN username is the Keycloak `client_id` and the bind password is the client `client_secret`:
+Two bind forms are supported:
+
+**Service accounts** (OAuth 2.0 client credentials grant, one grant per connection, token refreshed automatically): the bind DN username is the Keycloak `client_id` and the bind password is the client `client_secret`:
 
 ```
 ldapsearch ... -D "cn=<client_id>,cn=bind,dc=example,dc=com" -w "<client_secret>" \
   -b "cn=users,dc=example,dc=com" "(objectClass=user)"
 ```
 
+**Users** (OAuth 2.0 resource owner password credentials grant, i.e. Keycloak's *direct access grants*): the bind DN username is the Keycloak username and the bind password is the user's password. The password is validated against the realm's token endpoint using the configured `keycloakclientid`/`keycloakclientsecret`; on success the connection's searches run as that client's service account:
+
+```
+ldapsearch ... -D "cn=<username>,cn=users,dc=example,dc=com" -w "<user_password>" \
+  -b "cn=users,dc=example,dc=com" "(objectClass=user)"
+```
+
 Searches accept arbitrary LDAP filters and attribute subsets over the users and groups containers. Simple equality filters on `sAMAccountName`/`cn`/`userPrincipalName`/`mail`/`givenName`/`sn` (groups: `sAMAccountName`/`cn`) are pushed down to Keycloak REST queries; all other filters are evaluated server-side over the full list. Results are limited to Keycloak's default page size (100 entries) when listing everything.
 
-The Keycloak client must be confidential with *Service accounts roles* enabled; give its service account the `realm-management` roles `view-users`, `query-users` and `query-groups`. Add/Modify/Delete are not supported (read-only proxy). A complete example is in [sample-keycloak.cfg](https://github.com/glauth/glauth/blob/master/v2/sample-keycloak.cfg).
+Service-account clients must be confidential with *Service accounts roles* enabled; give the service account the `realm-management` roles `view-users`, `query-users` and `query-groups`. The client named by `keycloakclientid` additionally needs *Direct access grants* enabled to validate user passwords. Add/Modify/Delete are not supported (read-only proxy). A complete example is in [sample-keycloak.cfg](https://github.com/glauth/glauth/blob/master/v2/sample-keycloak.cfg).
 
 ### Docker and Kubernetes:
 

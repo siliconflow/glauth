@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -234,6 +236,65 @@ func TestTokenEndpoint(t *testing.T) {
 		keycloakRealm:    "test-realm"}
 	assert.Equal(t, "https://localhost:8443/realms/test-realm/protocol/"+
 		"openid-connect/token", c.tokenEndpoint())
+}
+
+func TestBindUserName(t *testing.T) {
+	base := "cn=users,dc=example,dc=com"
+
+	name, ok := bindUserName("cn=alice,"+base, base)
+	assert.True(t, ok)
+	assert.Equal(t, "alice", name)
+
+	// Attribute type and base match case-insensitively (RFC 4514).
+	name, ok = bindUserName("CN=alice,CN=Users,DC=Example,DC=COM", base)
+	assert.True(t, ok)
+	assert.Equal(t, "alice", name)
+
+	// Escaped characters in the value are unescaped (RFC 4514).
+	name, ok = bindUserName(`cn=al\69ce,`+base, base)
+	assert.True(t, ok)
+	assert.Equal(t, "alice", name)
+
+	// Wrong base, wrong attribute type, and empty value are rejected.
+	_, ok = bindUserName("cn=alice,cn=bind,dc=example,dc=com", base)
+	assert.False(t, ok)
+	_, ok = bindUserName("uid=alice,"+base, base)
+	assert.False(t, ok)
+	_, ok = bindUserName("cn=,"+base, base)
+	assert.False(t, ok)
+}
+
+func TestPasswordGrant(t *testing.T) {
+	log := zerolog.Nop()
+
+	// A well-formed direct access grant succeeds: the token endpoint
+	// receives grant_type=password with the client credentials and the
+	// user's username and password.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.NoError(t, r.ParseForm())
+		if r.Form.Get("grant_type") != "password" ||
+			r.Form.Get("username") != "alice" ||
+			r.Form.Get("password") != "s3cret" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"tok","token_type":"Bearer","expires_in":300}`))
+	}))
+	defer srv.Close()
+	assert.NoError(t, passwordGrant(srv.URL, "glauth", "clientsecret",
+		"alice", "s3cret", &log))
+
+	// Keycloak rejects wrong user credentials with an error response;
+	// the grant surfaces it as an error.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"invalid_grant","error_description":"Invalid user credentials"}`))
+	}))
+	defer bad.Close()
+	assert.Error(t, passwordGrant(bad.URL, "glauth", "clientsecret",
+		"alice", "wrong", &log))
 }
 
 func TestNormalizeDN(t *testing.T) {

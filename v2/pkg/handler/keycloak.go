@@ -48,10 +48,12 @@ type keycloakSessions struct {
 }
 
 type keycloakHandlerConfig struct {
-	keycloakHostname string
-	keycloakPort     int
-	keycloakRealm    string
-	keycloakDomain   string
+	keycloakHostname     string
+	keycloakPort         int
+	keycloakRealm        string
+	keycloakDomain       string
+	keycloakClientID     string
+	keycloakClientSecret string
 }
 
 type keycloakSession struct {
@@ -74,8 +76,6 @@ type keycloakUser struct {
 	Username  string `json:"username"`
 }
 
-// Handler (Binder)
-
 func (h keycloakHandler) Bind(
 	bindDN string,
 	bindSimplePw string,
@@ -89,32 +89,75 @@ func (h keycloakHandler) Bind(
 			errors.New("misconfiguration")
 	}
 
-	pre := "cn="
-	suf := "," + h.baseDNBindUsers
-	// DN matching is case-insensitive (RFC 4514); the bind DN is
-	// cn=<clientID>,cn=bind,<domain>.
-	if len(bindDN) < len(pre)+len(suf) ||
-		!strings.EqualFold(bindDN[:len(pre)], pre) ||
+	// Service-account bind: the bind DN is cn=<clientID>,cn=bind,
+	// <domain> and the password is the client secret (client
+	// credentials grant). DN matching is case-insensitive (RFC 4514).
+	if clientID, ok := bindUserName(bindDN, h.baseDNBindUsers); ok {
+		s, err := h.sessions.open(connID(conn), h.cfg.tokenEndpoint(),
+			clientID, bindSimplePw, bindDN, h.log)
+		if err != nil {
+			h.log.Error().Err(err).Msg("Bind response")
+			return ldap.LDAPResultInvalidCredentials, nil
+		}
+		h.log.Debug().
+			Time("expiry", s.token.Expiry).
+			Msg("Bind response")
+		return ldap.LDAPResultSuccess, nil
+	}
+
+	// User bind: the bind DN is cn=<username>,cn=users,<domain> and
+	// the password is the user's password, validated through a direct
+	// access grant against the configured client. On success the
+	// connection's session is opened with that client's credentials,
+	// so searches run as its service account.
+	if username, ok := bindUserName(bindDN, h.baseDNUsers); ok {
+		if h.cfg.keycloakClientID == "" {
+			h.log.Error().
+				Msg("keycloakclientid not set; user binds unsupported")
+			return ldap.LDAPResultOperationsError,
+				errors.New("misconfiguration")
+		}
+		err := passwordGrant(h.cfg.tokenEndpoint(),
+			h.cfg.keycloakClientID, h.cfg.keycloakClientSecret,
+			username, bindSimplePw, h.log)
+		if err != nil {
+			h.log.Error().Err(err).Msg("Bind response")
+			return ldap.LDAPResultInvalidCredentials, nil
+		}
+		s, err := h.sessions.open(connID(conn), h.cfg.tokenEndpoint(),
+			h.cfg.keycloakClientID, h.cfg.keycloakClientSecret,
+			bindDN, h.log)
+		if err != nil {
+			h.log.Error().Err(err).Msg("Bind response")
+			return ldap.LDAPResultInvalidCredentials, nil
+		}
+		h.log.Debug().
+			Time("expiry", s.token.Expiry).
+			Msg("Bind response")
+		return ldap.LDAPResultSuccess, nil
+	}
+
+	h.log.Error().
+		Str("baseUsers", h.baseDNUsers).
+		Str("baseBindUsers", h.baseDNBindUsers).
+		Msg("invalid bindDN")
+	return ldap.LDAPResultInvalidCredentials, nil
+}
+
+// bindUserName extracts the cn value from a bind DN of the form
+// "cn=<name>,<base>", comparing attribute type and base case-
+// insensitively (RFC 4514) and unescaping the value (RFC 4514).
+func bindUserName(bindDN, base string) (string, bool) {
+	suf := "," + base
+	if len(bindDN) <= len(suf) ||
 		!strings.EqualFold(bindDN[len(bindDN)-len(suf):], suf) {
-		h.log.Error().
-			Str("base", h.baseDNBindUsers).
-			Msg("invalid bindDN")
-		return ldap.LDAPResultInvalidCredentials, nil
+		return "", false
 	}
-
-	clientID := bindDN[len(pre) : len(bindDN)-len(suf)]
-	clientSecret := bindSimplePw
-	s, err := h.sessions.open(connID(conn), h.cfg.tokenEndpoint(),
-		clientID, clientSecret, bindDN, h.log)
-	if err != nil {
-		h.log.Error().Err(err).Msg("Bind response")
-		return ldap.LDAPResultInvalidCredentials, nil
+	attr, value, ok := parseRDN(bindDN[:len(bindDN)-len(suf)])
+	if !ok || !strings.EqualFold(attr, "cn") || value == "" {
+		return "", false
 	}
-
-	h.log.Debug().
-		Time("expiry", s.token.Expiry).
-		Msg("Bind response")
-	return ldap.LDAPResultSuccess, nil
+	return value, true
 }
 
 var rootDSEAttributes = []string{
@@ -1013,6 +1056,46 @@ func escapeDNValue(v string) string {
 	return sb.String()
 }
 
+// passwordGrant validates a user's username and password against the
+// token endpoint through an OAuth 2.0 resource owner password
+// credentials grant (Keycloak's "direct access grants") on the given
+// client. The grant is a credential check only: the returned token is
+// discarded, and searches keep using the client's service account.
+func passwordGrant(
+	tokenEndpoint string,
+	clientID string,
+	clientSecret string,
+	username string,
+	password string,
+	log *zerolog.Logger,
+) error {
+	oauth2Config := &oauth2.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		Endpoint:     oauth2.Endpoint{TokenURL: tokenEndpoint},
+	}
+
+	ctx := context.Background()
+	log.Debug().
+		Str("endpoint", tokenEndpoint).
+		Str("grant_type", "password").
+		Str("client_id", clientID).
+		Str("username", username).
+		Msg("OAuth 2.0 authorization request")
+
+	token, err := oauth2Config.PasswordCredentialsToken(ctx, username, password)
+	if err != nil {
+		log.Error().Err(err).Msg("OAuth 2.0 error response")
+		return err
+	} else if !token.Valid() {
+		err := errors.New("invalid token")
+		log.Error().Err(err).Msg("OAuth 2.0 error response")
+		return err
+	}
+	log.Debug().Msg("OAuth 2.0 access token response")
+	return nil
+}
+
 func clientCredentialsGrant(
 	tokenEndpoint string,
 	clientID string,
@@ -1068,10 +1151,12 @@ func newKeycloakHandlerConfig(
 	backend config.Backend,
 ) (*keycloakHandlerConfig, error) {
 	c := &keycloakHandlerConfig{
-		keycloakHostname: backend.KeycloakHostname,
-		keycloakPort:     backend.KeycloakPort,
-		keycloakRealm:    backend.KeycloakRealm,
-		keycloakDomain:   strings.TrimSuffix(backend.KeycloakDomain, "."),
+		keycloakHostname:     backend.KeycloakHostname,
+		keycloakPort:         backend.KeycloakPort,
+		keycloakRealm:        backend.KeycloakRealm,
+		keycloakDomain:       strings.TrimSuffix(backend.KeycloakDomain, "."),
+		keycloakClientID:     backend.KeycloakClientID,
+		keycloakClientSecret: backend.KeycloakClientSecret,
 	}
 
 	if c.keycloakHostname == "" {
