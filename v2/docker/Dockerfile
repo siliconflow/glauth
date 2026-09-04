@@ -10,8 +10,7 @@ WORKDIR /src
 
 # Download modules first for layer caching
 COPY go.mod go.sum ./
-RUN make buildmainembeds
-RUN go mod tidy
+RUN go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/glauth .
