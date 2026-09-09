@@ -12,7 +12,6 @@ require (
 	github.com/go-asn1-ber/asn1-ber v1.5.5
 	github.com/go-resty/resty/v2 v2.17.2
 	github.com/jinzhu/copier v0.4.0
-	github.com/mattn/go-sqlite3 v1.14.50
 	github.com/pquerna/otp v1.4.0
 	github.com/prometheus/client_golang v1.18.0
 	github.com/prometheus/client_model v0.5.0

@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	ber "github.com/go-asn1-ber/asn1-ber"
 	"github.com/glauth/ldap"
+	ber "github.com/go-asn1-ber/asn1-ber"
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/rs/zerolog"
 )
 
 func decompiled(t *testing.T, f *ber.Packet) string {
@@ -67,7 +67,6 @@ func TestUserQueryEquality(t *testing.T) {
 		"email": "a@b.c", "exact": "true"}, userQuery("(&(objectClass=user)(mail=a@b.c))"))
 
 	assert.Equal(t, "a@b.c", userQuery("(MAIL=a@b.c)")["email"])
-
 
 	// objectClass=inetOrgPerson (the form Keycloak/SSO clients actually
 	// send, and one of the user entry's emitted object classes) narrows
@@ -239,28 +238,40 @@ func TestTokenEndpoint(t *testing.T) {
 }
 
 func TestBindUserName(t *testing.T) {
-	base := "cn=users,dc=example,dc=com"
+	base := "ou=users,dc=example,dc=com"
 
-	name, ok := bindUserName("cn=alice,"+base, base)
+	// User entries are uid=<username>,ou=users,... — uid only.
+	name, ok := bindUserName("uid=alice,"+base, base, "uid")
 	assert.True(t, ok)
 	assert.Equal(t, "alice", name)
 
 	// Attribute type and base match case-insensitively (RFC 4514).
-	name, ok = bindUserName("CN=alice,CN=Users,DC=Example,DC=COM", base)
+	name, ok = bindUserName("UID=alice,OU=Users,DC=Example,DC=COM",
+		base, "uid")
 	assert.True(t, ok)
 	assert.Equal(t, "alice", name)
 
 	// Escaped characters in the value are unescaped (RFC 4514).
-	name, ok = bindUserName(`cn=al\69ce,`+base, base)
+	name, ok = bindUserName(`uid=al\69ce,`+base, base, "uid")
 	assert.True(t, ok)
 	assert.Equal(t, "alice", name)
 
-	// Wrong base, wrong attribute type, and empty value are rejected.
-	_, ok = bindUserName("cn=alice,cn=bind,dc=example,dc=com", base)
+	// Wrong base, an attribute type not in the accepted list, and an
+	// empty value are rejected.
+	_, ok = bindUserName("uid=alice,cn=bind,dc=example,dc=com",
+		base, "uid")
 	assert.False(t, ok)
-	_, ok = bindUserName("uid=alice,"+base, base)
+	_, ok = bindUserName("cn=alice,"+base, base, "uid")
 	assert.False(t, ok)
-	_, ok = bindUserName("cn=,"+base, base)
+	_, ok = bindUserName("uid=,"+base, base, "uid")
+	assert.False(t, ok)
+
+	// Service-account binds accept cn only.
+	bindBase := "cn=bind,dc=example,dc=com"
+	name, ok = bindUserName("cn=glauth,"+bindBase, bindBase, "cn")
+	assert.True(t, ok)
+	assert.Equal(t, "glauth", name)
+	_, ok = bindUserName("uid=glauth,"+bindBase, bindBase, "cn")
 	assert.False(t, ok)
 }
 
@@ -340,6 +351,38 @@ func TestEscapeDNValue(t *testing.T) {
 	assert.Equal(t, `al\=\;ice`, escapeDNValue("al=;ice"))
 	// NUL is escaped as \00.
 	assert.Equal(t, "al\\00ice", escapeDNValue("al\x00ice"))
+}
+
+func TestExtendedWhoAmI(t *testing.T) {
+	// Who Am I? (RFC 4532) and any other extended operation are
+	// acknowledged with success; the library does not expose the
+	// request OID, so no per-operation handling is possible.
+	h := keycloakHandler{log: &zerolog.Logger{}}
+	code, err := h.Extended("uid=alice,ou=users,dc=example,dc=com",
+		ldap.ExtendedRequest{}, nil)
+	assert.NoError(t, err)
+	assert.EqualValues(t, ldap.LDAPResultSuccess, code)
+}
+
+func TestRootDSESupportedExtension(t *testing.T) {
+	// The root DSE advertises Who Am I? (RFC 4532) as a supported
+	// extension so clients can discover it.
+	h := &keycloakHandler{
+		cfg: &keycloakHandlerConfig{
+			keycloakDomain:   "example.com",
+			keycloakHostname: "idp.example.com",
+		},
+		baseDN: "dc=example,dc=com",
+	}
+	res := h.rootDSESearchResult()
+	require.Len(t, res.Entries, 1)
+	for _, a := range res.Entries[0].Attributes {
+		if a.Name == "supportedExtension" {
+			assert.Equal(t, []string{oidWhoAmI}, a.Values)
+			return
+		}
+	}
+	t.Fatal("supportedExtension not advertised in root DSE")
 }
 
 func TestSearchErrorNotFound(t *testing.T) {
