@@ -1,8 +1,0 @@
-bin
-charts
-helm
-docker
-*.md
-.git
-.gitignore
-.github

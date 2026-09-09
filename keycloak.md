@@ -16,8 +16,8 @@ GLAuth 新增 `datastore = "keycloak"` 后端(`v2/pkg/server/server.go` 注册),
 
 ```
 dc=example,dc=com                  ← naming context 根(域名条目)
-├── cn=users,dc=example,dc=com     ← realm 用户(叶子条目:cn=<username>,...)
-├── cn=groups,dc=example,dc=com    ← realm 组(叶子条目:cn=<group>,...)
+├── ou=users,dc=example,dc=com     ← realm 用户(叶子条目:uid=<username>,...)
+├── ou=groups,dc=example,dc=com    ← realm 组(叶子条目:cn=<group>,...)
 └── cn=bind,dc=example,dc=com      ← 服务账号(客户端)bind 专用命名空间
 ```
 
@@ -25,7 +25,7 @@ Root DSE(空 base DN + base scope 查询)返回 `namingContexts`、`defaultNamin
 
 ## 2. 认证(Bind)流程
 
-Bind 根据 bind DN 的后缀分两类(属性类型与 base 比较均按 RFC 4514 大小写不敏感,cn 值按 RFC 4514 反转义):
+Bind 根据 bind DN 的后缀分两类(属性类型与 base 比较均按 RFC 4514 大小写不敏感,RDN 值按 RFC 4514 反转义):
 
 ### 2.1 服务账号 bind:`cn=<client-id>,cn=bind,dc=...`
 
@@ -51,11 +51,11 @@ LDAP 客户端                    GLAuth                         Keycloak
 - 成功后为该 LDAP **连接**建立一个会话(每连接独立,`keycloakSessions.byConnID`),保存 clientID/secret/token;
 - 失败返回 `InvalidCredentials`。
 
-### 2.2 用户 bind:`cn=<username>,cn=users,dc=...`
+### 2.2 用户 bind:`uid=<username>,ou=users,dc=...`
 
 ```
 LDAP 客户端                    GLAuth                              Keycloak
-    │  bind cn=alice,cn=users,dc=... │                                   │
+    │  bind uid=alice,ou=users,dc=... │                                   │
     │  password = alice 的密码        │                                   │
     │───────────────────────────────>│                                   │
     │                                │ ① POST token 端点                 │
@@ -80,11 +80,11 @@ LDAP 客户端                    GLAuth                              Keycloak
 ## 3. 查询(Search)流程
 
 1. **会话检查**:按连接 ID 取会话;若 token 过期(`token.Valid()` 为假),用保存的 clientID/secret 重新做 client credentials grant 刷新(未用 refresh token);
-2. **base DN / scope 分发**:DIT 是扁平的(域根 → users/groups 容器 → 叶子),subtree 与 single-level 覆盖相同叶子;对 `cn=<name>,cn=users,...` 的叶子查询直接用 `username=<name>&exact=true` 缩小 REST 查询;
+2. **base DN / scope 分发**:DIT 是扁平的(域根 → users/groups 容器 → 叶子),subtree 与 single-level 覆盖相同叶子;对 `uid=<name>,ou=users,...` 的叶子查询直接用 `username=<name>&exact=true` 缩小 REST 查询;
 3. **查询收窄(narrowing)**:解析 LDAP filter,剥掉 `objectClass` 等值匹配后,若剩余为纯等值匹配(AND 组合),映射为 Keycloak REST 查询参数:
 
    | LDAP 属性 | Keycloak users 参数 |
-   |---|---|
+   | --- | --- |
    | `sAMAccountName` / `cn` / `userPrincipalName` / `uid` | `username` |
    | `mail` | `email` |
    | `givenName` | `firstName` |
@@ -92,7 +92,7 @@ LDAP 客户端                    GLAuth                              Keycloak
 
    并附加 `exact=true`;组查询的 `sAMAccountName`/`cn` 等值映射为 substring `search` 参数。其他 filter 形态(OR/NOT/子串/present 等)不收窄,拉全量后由 LDAP server 端(`EnforceLDAP`)自行按真实 filter 过滤——收窄只需是超集即可;
 4. **分页**:users/groups 端点按 `first`/`max=500` 翻页(规避 Keycloak 默认 100 条静默截断),并检测服务端忽略分页(首条 ID 重复即停);
-5. **条目渲染**:用户映射为 `inetOrgPerson`/`user` 等 objectClass,属性含 `sAMAccountName`、`cn`、`uid`、`givenName`、`sn`、`displayName`、`userPrincipalName`(= `username@domain`)、`mail`;组映射为 `group`,含 `objectSid`(由 Keycloak id + domain 合成 SID,供 Windows 类客户端使用);
+5. **条目渲染**:用户映射为 `inetOrgPerson`/`user` 等 objectClass,RDN 为 `uid=<username>`,属性含 `sAMAccountName`、`cn`、`uid`、`givenName`、`sn`、`displayName`、`userPrincipalName`(= `username@domain`)、`mail`;组映射为 `group`,RDN 为 `cn=<group>`,含 `objectSid`(由 Keycloak id + domain 合成 SID,供 Windows 类客户端使用);
 6. Close 时移除该连接的会话。
 
 ## 4. Keycloak client 配置注意事项
@@ -102,7 +102,7 @@ GLAuth 侧配置(`[backend]`):`keycloakhostname`、`keycloakport`(默认 8443,**
 ### 4.1 必须开启的能力
 
 | 配置项 | 要求 | 原因 |
-|---|---|---|
+| --- | --- | --- |
 | **Client authentication**(confidential client) | ON | 两种 bind 都走 client credentials / password grant,需要 client secret;public client 无 secret 可用 |
 | **Service Accounts Enabled** | ON | bind 成功后所有 Search 都以该 client 的 service account 调 Admin REST API |
 | **Direct Access Grants Enabled** | ON | 用户密码 bind(2.2 第一步)依赖 `grant_type=password` |

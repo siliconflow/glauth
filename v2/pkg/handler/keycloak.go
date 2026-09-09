@@ -92,7 +92,7 @@ func (h keycloakHandler) Bind(
 	// Service-account bind: the bind DN is cn=<clientID>,cn=bind,
 	// <domain> and the password is the client secret (client
 	// credentials grant). DN matching is case-insensitive (RFC 4514).
-	if clientID, ok := bindUserName(bindDN, h.baseDNBindUsers); ok {
+	if clientID, ok := bindUserName(bindDN, h.baseDNBindUsers, "cn"); ok {
 		s, err := h.sessions.open(connID(conn), h.cfg.tokenEndpoint(),
 			clientID, bindSimplePw, bindDN, h.log)
 		if err != nil {
@@ -105,12 +105,12 @@ func (h keycloakHandler) Bind(
 		return ldap.LDAPResultSuccess, nil
 	}
 
-	// User bind: the bind DN is cn=<username>,cn=users,<domain> and
+	// User bind: the bind DN is uid=<username>,ou=users,<domain> and
 	// the password is the user's password, validated through a direct
 	// access grant against the configured client. On success the
 	// connection's session is opened with that client's credentials,
 	// so searches run as its service account.
-	if username, ok := bindUserName(bindDN, h.baseDNUsers); ok {
+	if username, ok := bindUserName(bindDN, h.baseDNUsers, "uid"); ok {
 		if h.cfg.keycloakClientID == "" {
 			h.log.Error().
 				Msg("keycloakclientid not set; user binds unsupported")
@@ -144,17 +144,18 @@ func (h keycloakHandler) Bind(
 	return ldap.LDAPResultInvalidCredentials, nil
 }
 
-// bindUserName extracts the cn value from a bind DN of the form
-// "cn=<name>,<base>", comparing attribute type and base case-
-// insensitively (RFC 4514) and unescaping the value (RFC 4514).
-func bindUserName(bindDN, base string) (string, bool) {
+// bindUserName extracts the RDN value from a bind DN of the form
+// "<attr>=<name>,<base>" where attr is one of attrs, comparing
+// attribute types and the base case-insensitively (RFC 4514) and
+// unescaping the value (RFC 4514).
+func bindUserName(bindDN, base string, attrs ...string) (string, bool) {
 	suf := "," + base
 	if len(bindDN) <= len(suf) ||
 		!strings.EqualFold(bindDN[len(bindDN)-len(suf):], suf) {
 		return "", false
 	}
 	attr, value, ok := parseRDN(bindDN[:len(bindDN)-len(suf)])
-	if !ok || !strings.EqualFold(attr, "cn") || value == "" {
+	if !ok || value == "" || !containsFold(attrs, attr) {
 		return "", false
 	}
 	return value, true
@@ -181,6 +182,7 @@ var rootDSEAttributes = []string{
 	"subschemaSubentry",
 	"supportedCapabilities",
 	"supportedControl",
+	"supportedExtension",
 	"supportedLDAPPolicies",
 	"supportedLDAPVersion",
 	"supportedSASLMechanisms"}
@@ -279,7 +281,7 @@ func (h keycloakHandler) Search(
 		return nil
 	}
 
-	// The DIT is flat: a domain root holding the cn=users and cn=groups
+	// The DIT is flat: a domain root holding the ou=users and ou=groups
 	// containers, each holding leaf entries one level deep, so
 	// single-level and subtree searches cover the same leaves. Subtree
 	// scope includes the base object itself (RFC 4511 4.5.1).
@@ -341,42 +343,50 @@ func (h keycloakHandler) Search(
 		}
 	default:
 		// Base-object or single-level search on a single entry:
-		// cn=<name>,<container>. Narrow by the RDN value; EnforceLDAP
-		// keeps only the entry whose DN equals the base (base scope) and
-		// drops it for single-level scope (a leaf has no subordinates).
+		// uid=<name>,ou=users,... or cn=<name>,ou=groups,... Narrow by
+		// the RDN value; EnforceLDAP keeps only the entry whose DN equals
+		// the base (base scope) and drops it for single-level scope (a
+		// leaf has no subordinates).
 		head, rest := splitDN(req.BaseDN)
 		attr, value, ok := parseRDN(head)
-		if ok && strings.EqualFold(attr, "cn") {
-			switch normalizeDN(rest) {
-			case h.baseDNUsers:
-				e, err := h.usersSearchResult(session,
-					map[string]string{"username": value, "exact": "true"})
-				if err != nil {
-					h.log.Error().Err(err).Msg("Search response")
-					return searchError(ldap.LDAPResultOperationsError, "%s", err)
-				}
-				if len(e) == 0 {
-					err := fmt.Errorf("no such object: %s", req.BaseDN)
-					h.log.Error().Err(err).Msg("Search response")
-					return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
-				}
-				entries = e
-			case h.baseDNGroups:
-				e, err := h.groupsSearchResult(session,
-					map[string]string{"search": value})
-				if err != nil {
-					h.log.Error().Err(err).Msg("Search response")
-					return searchError(ldap.LDAPResultOperationsError, "%s", err)
-				}
-				if len(e) == 0 {
-					err := fmt.Errorf("no such object: %s", req.BaseDN)
-					h.log.Error().Err(err).Msg("Search response")
-					return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
-				}
-				entries = e
-			default:
+		switch normalizeDN(rest) {
+		case h.baseDNUsers:
+			// User entries are uid=<username>.
+			if !ok || !strings.EqualFold(attr, "uid") {
 				ok = false
+				break
 			}
+			e, err := h.usersSearchResult(session,
+				map[string]string{"username": value, "exact": "true"})
+			if err != nil {
+				h.log.Error().Err(err).Msg("Search response")
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+			if len(e) == 0 {
+				err := fmt.Errorf("no such object: %s", req.BaseDN)
+				h.log.Error().Err(err).Msg("Search response")
+				return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
+			}
+			entries = e
+		case h.baseDNGroups:
+			if !ok || !strings.EqualFold(attr, "cn") {
+				ok = false
+				break
+			}
+			e, err := h.groupsSearchResult(session,
+				map[string]string{"search": value})
+			if err != nil {
+				h.log.Error().Err(err).Msg("Search response")
+				return searchError(ldap.LDAPResultOperationsError, "%s", err)
+			}
+			if len(e) == 0 {
+				err := fmt.Errorf("no such object: %s", req.BaseDN)
+				h.log.Error().Err(err).Msg("Search response")
+				return searchError(ldap.LDAPResultNoSuchObject, "%s", err)
+			}
+			entries = e
+		default:
+			ok = false
 		}
 		if !ok {
 			err := fmt.Errorf("no such object: %s", req.BaseDN)
@@ -416,6 +426,30 @@ func (h keycloakHandler) Close(
 	h.sessions.remove(connID(conn))
 	h.log.Debug().Msg("Close response")
 	return nil
+}
+
+// oidWhoAmI is the RFC 4532 "Who Am I?" extended operation OID,
+// advertised in the root DSE's supportedExtension attribute.
+const oidWhoAmI = "1.3.6.1.4.1.4203.1.11.3"
+
+// Handler (Extender)
+
+// Extended acknowledges extended operations with success, without
+// effect: the LDAP library does not export the request OID
+// (ExtendedRequest.requestName), so operations cannot be told apart —
+// Who Am I? (RFC 4532, sent by ldapwhoami) gets the success it needs,
+// and StartTLS never reaches here (the library intercepts it when TLS
+// is configured). The response carries no responseValue (the library
+// does not encode one), so the client reports an empty identity.
+func (h keycloakHandler) Extended(
+	boundDN string,
+	req ldap.ExtendedRequest,
+	conn net.Conn,
+) (ldap.LDAPResultCode, error) {
+	h.log.Debug().
+		Str("boundDN", boundDN).
+		Msg("Extended request")
+	return ldap.LDAPResultSuccess, nil
 }
 
 // Handler (Adder)
@@ -644,6 +678,7 @@ func (h *keycloakHandler) rootDSESearchResult() ldap.ServerSearchResult {
 		"dnsHostName":          {h.cfg.keycloakHostname},
 		"ldapServiceName":      {h.cfg.keycloakHostname},
 		"namingContexts":       {h.baseDN},
+		"supportedExtension":   {oidWhoAmI},
 		"supportedLDAPVersion": {"3"},
 	}
 	a := make([]*ldap.EntryAttribute, len(rootDSEAttributes))
@@ -702,9 +737,11 @@ func (h *keycloakHandler) usersSearchResult(
 	return e, nil
 }
 
-// userEntry renders a Keycloak user as an LDAP user entry. The
-// attributes cover every attribute the query narrowing maps, so that
-// server-side filter enforcement (EnforceLDAP) can match them.
+// userEntry renders a Keycloak user as an LDAP user entry. The RDN is
+// uid=<username> (the inetOrgPerson login identifier); cn carries the
+// same value as an alias. The attributes cover every attribute the
+// query narrowing maps, so that server-side filter enforcement
+// (EnforceLDAP) can match them.
 func (h *keycloakHandler) userEntry(user keycloakUser) *ldap.Entry {
 	displayName := strings.TrimSpace(user.FirstName + " " + user.LastName)
 	if displayName == "" {
@@ -714,7 +751,7 @@ func (h *keycloakHandler) userEntry(user keycloakUser) *ldap.Entry {
 		Str("username", user.Username).
 		Msg("user")
 	return &ldap.Entry{
-		DN: fmt.Sprintf("cn=%s,%s",
+		DN: fmt.Sprintf("uid=%s,%s",
 			escapeDNValue(user.Username), h.baseDNUsers),
 		Attributes: []*ldap.EntryAttribute{
 			{Name: "objectClass", Values: []string{
@@ -746,13 +783,13 @@ func (h *keycloakHandler) domainEntry() *ldap.Entry {
 	}
 }
 
-// containerEntry renders the cn=users / cn=groups containers.
+// containerEntry renders the ou=users / ou=groups containers.
 func containerEntry(dn, name string) *ldap.Entry {
 	return &ldap.Entry{
 		DN: dn,
 		Attributes: []*ldap.EntryAttribute{
-			{Name: "objectClass", Values: []string{"top", "container"}},
-			newAttribute("cn", name),
+			{Name: "objectClass", Values: []string{"top", "organizationalUnit"}},
+			newAttribute("ou", name),
 		},
 	}
 }
@@ -809,8 +846,8 @@ func NewKeycloakHandler(opts ...Option) Handler {
 	// Base DNs are stored normalized so that request base DNs can be
 	// compared case-insensitively (RFC 4514).
 	h.baseDN = normalizeDN(b)
-	h.baseDNUsers = "cn=users," + h.baseDN
-	h.baseDNGroups = "cn=groups," + h.baseDN
+	h.baseDNUsers = "ou=users," + h.baseDN
+	h.baseDNGroups = "ou=groups," + h.baseDN
 	h.baseDNBindUsers = "cn=bind," + h.baseDN
 	h.restClient = resty.New()
 	h.sessions = &keycloakSessions{

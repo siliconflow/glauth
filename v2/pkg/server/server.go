@@ -204,6 +204,12 @@ func NewServer(opts ...Option) (*LdapSvc, error) {
 			s.l.BindFunc("", h)
 			s.l.SearchFunc("", h)
 			s.l.CloseFunc("", h)
+			// Extended operations (e.g. Who Am I?, RFC 4532) are served
+			// by backends implementing ldap.Extender; otherwise the
+			// library's default handler rejects them with ProtocolError.
+			if ext, ok := h.(ldap.Extender); ok {
+				s.l.ExtendedFunc("", ext)
+			}
 		}
 		allHandlers.Handlers[i] = h
 		backendCounter++
